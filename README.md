@@ -1,10 +1,8 @@
 # LatchLine
 
-LatchLine is a global Claude Code/Codex review hook that gates changes per prompt, logs diffs, and asks for explicit approval before applying feedback.
+![LatchLine logo](assets/latchline-logo.svg)
 
-## Contents
-- `src/latchline/cli.py`: The review hook entrypoint.
-- `config/reviewer.conf`: Configuration options for backend and blocking modes.
+LatchLine is a global Claude Code/Codex review hook that gates changes per prompt, logs diffs, and asks for explicit approval before applying feedback.
 
 ## Why “LatchLine”
 LatchLine is named for a latch: it holds changes at the end of a prompt, shows the review, and only proceeds when you explicitly release it (apply/skip).
@@ -65,10 +63,11 @@ Example `~/.claude/settings.json`:
 ## Configuration
 See `config/reviewer.conf` for defaults and supported values.
 
-Options:
-- `REVIEWER_BACKEND`: Which reviewer to run. `codex`, `claude`, or `both`.
-- `REVIEWER_BLOCK`: How hard to gate the session. `0` = log only, `1` = block on blockers, `2` = always block and ask for apply/skip.
-- `LATCHLINE_LOG_DIR`: Base directory for logs/state/runs (default `/tmp`; created if missing, falls back to `/tmp` on failure).
+| Config | Default | Values | Explanation |
+| --- | --- | --- | --- |
+| `REVIEWER_BACKEND` | `codex` | `codex`, `claude`, `both` | Which reviewer to run. |
+| `REVIEWER_BLOCK` | `0` | `0`, `1`, `2` | How hard to gate the session (`0` = log only, `1` = block on blockers, `2` = always block and ask for apply/skip). |
+| `LATCHLINE_LOG_DIR` | `/tmp` | Any path | Base directory for logs/state/runs (created if missing, falls back to `/tmp` on failure). |
 
 ## Development
 Run tests with `uv run --group dev pytest` or `just test`.

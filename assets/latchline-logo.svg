@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="LatchLine logo">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f1b2d" />
+      <stop offset="1" stop-color="#1f3b5b" />
+    </linearGradient>
+  </defs>
+  <circle cx="128" cy="128" r="120" fill="url(#bg)" />
+  <circle cx="128" cy="128" r="108" fill="none" stroke="#f2c14e" stroke-width="6" />
+  <path
+    d="M96 84v88a12 12 0 0 0 12 12h60"
+    fill="none"
+    stroke="#f8f5ef"
+    stroke-width="14"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <path
+    d="M168 168h-28"
+    fill="none"
+    stroke="#f8f5ef"
+    stroke-width="14"
+    stroke-linecap="round"
+  />
+  <circle cx="168" cy="168" r="10" fill="#f2c14e" />
+</svg>
