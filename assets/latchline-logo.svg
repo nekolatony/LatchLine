@@ -1,6 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="LatchLine logo">
-  <rect x="28" y="28" width="200" height="200" rx="36" fill="none" stroke="#1f2937" stroke-width="16" />
-  <path d="M104 72v112a16 16 0 0 0 16 16h64" fill="none" stroke="#1f2937" stroke-width="16" stroke-linecap="round" stroke-linejoin="round" />
-  <path d="M184 184h-32" fill="none" stroke="#f59e0b" stroke-width="16" stroke-linecap="round" />
-  <circle cx="184" cy="184" r="10" fill="#f59e0b" />
-</svg>
