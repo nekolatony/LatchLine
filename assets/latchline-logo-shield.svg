@@ -3,4 +3,6 @@
   <path d="M96 76v84a16 16 0 0 0 16 16h56" fill="none" stroke="#f8fafc" stroke-width="14" stroke-linecap="round" stroke-linejoin="round" />
   <path d="M168 176h-28" fill="none" stroke="#f59e0b" stroke-width="14" stroke-linecap="round" />
   <circle cx="168" cy="176" r="9" fill="#f59e0b" />
+  <circle cx="128" cy="212" r="10" fill="none" stroke="#f8fafc" stroke-width="6" />
+  <path d="M136 220l12 12" fill="none" stroke="#f8fafc" stroke-width="6" stroke-linecap="round" />
 </svg>
