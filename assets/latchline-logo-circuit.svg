@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="LatchLine circuit logo">
+  <rect x="24" y="24" width="208" height="208" rx="40" fill="#0b1020" stroke="#a3e635" stroke-width="8" />
+  <path d="M88 72v96a16 16 0 0 0 16 16h64" fill="none" stroke="#e5e7eb" stroke-width="14" stroke-linecap="round" stroke-linejoin="round" />
+  <path d="M168 184h-32" fill="none" stroke="#a3e635" stroke-width="14" stroke-linecap="round" />
+  <circle cx="168" cy="184" r="8" fill="#a3e635" />
+  <path d="M56 104h24M56 152h24M176 72v24M200 72v24" fill="none" stroke="#64748b" stroke-width="8" stroke-linecap="round" />
+  <circle cx="56" cy="104" r="5" fill="#64748b" />
+  <circle cx="56" cy="152" r="5" fill="#64748b" />
+  <circle cx="176" cy="96" r="5" fill="#64748b" />
+  <circle cx="200" cy="96" r="5" fill="#64748b" />
+</svg>

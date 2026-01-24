@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="LatchLine shield logo">
+  <path d="M128 16l84 32v72c0 56-36 96-84 120-48-24-84-64-84-120V48l84-32z" fill="#0f172a" stroke="#f59e0b" stroke-width="8" />
+  <path d="M96 76v84a16 16 0 0 0 16 16h56" fill="none" stroke="#f8fafc" stroke-width="14" stroke-linecap="round" stroke-linejoin="round" />
+  <path d="M168 176h-28" fill="none" stroke="#f59e0b" stroke-width="14" stroke-linecap="round" />
+  <circle cx="168" cy="176" r="9" fill="#f59e0b" />
+</svg>

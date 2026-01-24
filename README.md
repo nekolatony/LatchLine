@@ -2,6 +2,12 @@
 
 <img src="assets/latchline-logo.svg" width="120" alt="LatchLine logo" />
 
+Logo options (pick one):
+
+<img src="assets/latchline-logo-shield.svg" width="120" alt="LatchLine shield logo" />
+<img src="assets/latchline-logo-link.svg" width="120" alt="LatchLine link logo" />
+<img src="assets/latchline-logo-circuit.svg" width="120" alt="LatchLine circuit logo" />
+
 LatchLine is a global Claude Code/Codex review hook that gates changes per prompt, logs diffs, and asks for explicit approval before applying feedback.
 
 ## Why “LatchLine”
