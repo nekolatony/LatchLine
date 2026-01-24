@@ -1,6 +1,6 @@
 # LatchLine
 
-![LatchLine logo](assets/latchline-logo.svg)
+<img src="assets/latchline-logo.svg" width="120" alt="LatchLine logo" />
 
 LatchLine is a global Claude Code/Codex review hook that gates changes per prompt, logs diffs, and asks for explicit approval before applying feedback.
 
