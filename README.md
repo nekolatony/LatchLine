@@ -4,31 +4,39 @@ LatchLine is a global Claude Code/Codex review hook that gates changes per promp
 
 ## Contents
 - `src/latchline/cli.py`: The review hook entrypoint.
-- `hooks/ai-review.py`: Thin wrapper script (optional).
 - `config/reviewer.conf`: Configuration options for backend and blocking modes.
 
-## Quick start
-1. Install uv if you don't already have it.
+## Why “LatchLine”
+LatchLine is named for a latch: it holds changes at the end of a prompt, shows the review, and only proceeds when you explicitly release it (apply/skip).
+
+## Prerequisites
+- Python 3.10+
+- uv
+- Claude Code with hook support enabled
+
+## How to set up
+1. Clone this repo and note the absolute path.
 2. Copy `config/reviewer.conf` to `~/.latchline/settings.conf` (global) or to `.latchline/settings.conf` in your project root/current directory.
-3. Register the hook command in `~/.claude/settings.json` (see below).
+3. Register the hook command in `~/.claude/settings.json` using the repo path (example below).
+4. Restart Claude Code so the hook config is reloaded.
 
 ## Hook setup (Claude Code)
-LatchLine is a Claude Code hook command. It relies on the same hook events as your current `~/.claude/hooks/ai-review.sh` setup:
-- `UserPromptSubmit` to start a new review session.
-- `PreToolUse` for `Edit|Write` to snapshot files before changes.
-- `PostToolUse` for `AskUserQuestion` to record gate answers.
-- `Stop` to compute the diff and run the reviewer.
+LatchLine runs as a Claude Code hook command and must be registered for these events:
+- `UserPromptSubmit`
+- `PreToolUse` (with `Edit|Write`)
+- `PostToolUse` (with `AskUserQuestion`)
+- `Stop`
 
 Why each hook is needed:
 
-| Hook event | Why it matters |
-| --- | --- |
-| `UserPromptSubmit` | Starts a new prompt session so later edits are grouped correctly. |
-| `PreToolUse` (`Edit|Write`) | Captures a “before” snapshot of files so we can diff after edits. |
-| `PostToolUse` (`AskUserQuestion`) | Captures your response to the review gate (apply/skip) so the run log is complete. |
-| `Stop` | Finalizes the diff and runs the reviewer when the prompt finishes. |
+| Hook event | When it fires | Why it matters |
+| --- | --- | --- |
+| `UserPromptSubmit` | At the start of a prompt | Starts a new review session so edits are grouped correctly. |
+| `PreToolUse` (`Edit|Write`) | Right before edits | Captures a “before” snapshot so we can diff after edits. |
+| `PostToolUse` (`AskUserQuestion`) | After the review gate prompt | Records your apply/skip response so the run log is complete. |
+| `Stop` | When the prompt finishes | Finalizes the diff and runs the reviewer. |
 
-Replace the existing command in `~/.claude/settings.json` with a uv command that points at this repo:
+Example `~/.claude/settings.json`:
 ```json
 {
   "hooks": {
@@ -53,11 +61,14 @@ Replace the existing command in `~/.claude/settings.json` with a uv command that
   }
 }
 ```
-Optional: you can still point the hook at `hooks/ai-review.py`, but `uv run ... latchline` is the intended path.
 
 ## Configuration
 See `config/reviewer.conf` for defaults and supported values.
-`LATCHLINE_LOG_DIR` controls where runs/logs are written (default: `/tmp`).
+
+Options:
+- `REVIEWER_BACKEND`: Which reviewer to run. `codex`, `claude`, or `both`.
+- `REVIEWER_BLOCK`: How hard to gate the session. `0` = log only, `1` = block on blockers, `2` = always block and ask for apply/skip.
+- `LATCHLINE_LOG_DIR`: Base directory for logs/state/runs (default `/tmp`; created if missing, falls back to `/tmp` on failure).
 
 ## Development
 Run tests with `uv run --group dev pytest` or `just test`.
