@@ -9,6 +9,7 @@ LatchLine is named for a latch: it holds changes at the end of a prompt, shows t
 - Python 3.10+
 - uv
 - Claude Code with hook support enabled
+- Optional: Codex CLI (for `REVIEWER_BACKEND=codex`)
 
 ## How to set up
 1. Clone this repo and note the absolute path.
