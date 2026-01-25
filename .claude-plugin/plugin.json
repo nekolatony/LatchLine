@@ -1,11 +1,13 @@
 {
   "name": "latchline",
   "version": "0.1.0",
-  "description": "Review-gating hook that logs diffs and requires explicit apply/skip",
+  "description": "Review-gating hooks that log diffs and require explicit apply/skip",
   "author": {
-    "name": "Tony",
-    "email": "tony@example.com"
+    "name": "Tony"
   },
+  "homepage": "https://github.com/nekolatony/LatchLine",
   "repository": "https://github.com/nekolatony/LatchLine",
-  "license": "MIT"
+  "license": "MIT",
+  "keywords": ["claude-code", "hooks", "review", "code-review"],
+  "hooks": "./hooks/hooks.json"
 }
