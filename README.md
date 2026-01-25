@@ -17,6 +17,13 @@ LatchLine is named for a latch: it holds changes at the end of a prompt, shows t
 3. Register the hook command in `~/.claude/settings.json` using the repo path (example below).
 4. Restart Claude Code so the hook config is reloaded.
 
+## Marketplace install
+If installed from the Claude Code marketplace, hooks are registered by the plugin. Run the setup command once to create your global config:
+
+`/latchline-setup`
+
+That command writes `~/.latchline/settings.conf` from the template bundled with the plugin.
+
 ## Hook setup (Claude Code)
 LatchLine runs as a Claude Code hook command and must be registered for these events:
 - `UserPromptSubmit`
