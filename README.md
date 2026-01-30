@@ -66,6 +66,9 @@ See `config/reviewer.conf` for defaults and supported values.
 | --- | --- | --- | --- |
 | `REVIEWER_BACKEND` | `codex` | `codex`, `claude`, `both` | Which reviewer to run. |
 | `REVIEWER_BLOCK` | `0` | `0`, `1`, `2` | How hard to gate the session (`0` = log only, `1` = block on blockers, `2` = always block and ask for apply/skip). |
+| `REVIEWER_CONTEXT` | `1` | `0`, `1` | Whether to build a context bundle for diff-first reviews. |
+| `REVIEWER_CONTEXT_MAX_BYTES` | `500000` | Any integer | Max size of the context bundle in bytes (raise to include more context). |
+| `REVIEWER_CONTEXT_DEPTH` | `2` | Any integer | Dependency expansion depth for local imports. |
 | `LATCHLINE_LOG_DIR` | `/tmp` | Any path | Base directory for logs/state/runs (created if missing, falls back to `/tmp` on failure). |
 
 ## Development

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import glob
 import json
 import os
 import re
@@ -112,6 +114,69 @@ def resolve_log_dir(config: dict[str, str]) -> str:
     return fallback or "/tmp"
 
 
+def parse_bool(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    text = value.strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def parse_int(value: str | None, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def normalize_path(path: str, cwd_path: str) -> str:
+    expanded = os.path.expanduser(path)
+    if os.path.isabs(expanded):
+        return os.path.abspath(expanded)
+    return os.path.abspath(os.path.join(cwd_path, expanded))
+
+
+def is_within_root(path: str, root: str) -> bool:
+    if not root:
+        return False
+    try:
+        return os.path.commonpath([os.path.abspath(path), root]) == root
+    except ValueError:
+        return False
+
+
+def display_path(path: str, project_root: str) -> str:
+    if project_root and is_within_root(path, project_root):
+        return os.path.relpath(path, project_root)
+    return path
+
+
+def is_text_file(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read(4096)
+        return b"\x00" not in chunk
+    except OSError:
+        return False
+
+
+def read_text_limited(path: str, max_bytes: int) -> tuple[str, bool]:
+    try:
+        with open(path, "rb") as f:
+            data = f.read(max_bytes + 1)
+    except OSError:
+        return "", False
+    truncated = len(data) > max_bytes
+    if truncated:
+        data = data[:max_bytes]
+    return data.decode("utf-8", errors="replace"), truncated
+
+
 def find_project_root(start_dir: str) -> str:
     cur = os.path.abspath(start_dir)
     while True:
@@ -137,6 +202,354 @@ def resolve_config_path(cwd: str) -> str:
         if os.path.isfile(candidate):
             return candidate
     return candidates[-1]
+
+
+ROOT_ONLY_PATTERNS = [
+    ".github/workflows/*.yml",
+    ".github/workflows/*.yaml",
+    ".gitlab-ci.yml",
+    ".circleci/config.yml",
+    "azure-pipelines.yml",
+]
+
+COMMON_CONTEXT_PATTERNS = [
+    "Dockerfile",
+    "Dockerfile.*",
+    "docker-compose*.yml",
+    "docker-compose*.yaml",
+    "compose*.yml",
+    "compose*.yaml",
+    "Makefile",
+    "Justfile",
+    "package.json",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "tsconfig.json",
+    "go.mod",
+    "go.sum",
+    "Cargo.toml",
+    "Cargo.lock",
+    "Gemfile",
+    "Gemfile.lock",
+    "pyproject.toml",
+    "requirements*.txt",
+    "Pipfile",
+    "Pipfile.lock",
+    "poetry.lock",
+    "uv.lock",
+    "setup.cfg",
+    "setup.py",
+    ".env",
+    ".env.*",
+    ".env.example",
+    ".env.sample",
+    ".env.template",
+    ".tool-versions",
+    ".python-version",
+    ".nvmrc",
+    ".ruby-version",
+]
+
+INFRA_DIRS = ("infra", "terraform", "k8s", "kubernetes", "helm", "charts")
+
+
+def list_infra_files(project_root: str) -> list[str]:
+    if not project_root:
+        return []
+    patterns = ROOT_ONLY_PATTERNS + COMMON_CONTEXT_PATTERNS
+    matches: set[str] = set()
+    for pattern in patterns:
+        for path in glob.glob(os.path.join(project_root, pattern)):
+            if os.path.isfile(path):
+                matches.add(os.path.abspath(path))
+
+    for dirname in INFRA_DIRS:
+        base = os.path.join(project_root, dirname)
+        if not os.path.isdir(base):
+            continue
+        for root, _, files in os.walk(base):
+            for name in files:
+                if name.endswith((".yml", ".yaml", ".json", ".tf", ".tfvars")):
+                    matches.add(os.path.join(root, name))
+
+    return sorted(matches)
+
+
+def iter_dirs_to_root(start_dir: str, root: str) -> list[str]:
+    paths: list[str] = []
+    cur = os.path.abspath(start_dir)
+    root_path = os.path.abspath(root)
+    while True:
+        if not is_within_root(cur, root_path):
+            break
+        paths.append(cur)
+        if cur == root_path:
+            break
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return paths
+
+
+def list_adjacent_context_files(
+    changed_files: list[str], project_root: str
+) -> list[str]:
+    if not project_root:
+        return []
+    matches: set[str] = set()
+    for path in changed_files:
+        if not path:
+            continue
+        file_dir = os.path.dirname(path)
+        for directory in iter_dirs_to_root(file_dir, project_root):
+            for pattern in COMMON_CONTEXT_PATTERNS:
+                for match in glob.glob(os.path.join(directory, pattern)):
+                    if os.path.isfile(match):
+                        matches.add(os.path.abspath(match))
+    return sorted(matches)
+
+
+def list_test_files(project_root: str, changed_files: list[str]) -> list[str]:
+    if not project_root:
+        return []
+    base_names = {
+        os.path.splitext(os.path.basename(path))[0].lower()
+        for path in changed_files
+        if path
+    }
+    if not base_names:
+        return []
+    test_roots = [os.path.join(project_root, "tests"), os.path.join(project_root, "test")]
+    test_exts = {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
+    matches: set[str] = set()
+    for test_root in test_roots:
+        if not os.path.isdir(test_root):
+            continue
+        for root, _, files in os.walk(test_root):
+            for name in files:
+                ext = os.path.splitext(name)[1].lower()
+                if ext not in test_exts:
+                    continue
+                stem = os.path.splitext(name)[0].lower()
+                if any(base in stem for base in base_names):
+                    matches.add(os.path.join(root, name))
+    return sorted(matches)
+
+
+def resolve_python_module(
+    module: str, level: int, file_dir: str, project_root: str
+) -> list[str]:
+    if level > 0:
+        base_dir = file_dir
+        for _ in range(max(level - 1, 0)):
+            base_dir = os.path.dirname(base_dir)
+    else:
+        base_dir = project_root
+    module_path = module.replace(".", "/") if module else ""
+    candidates: list[str] = []
+    if module_path:
+        base = os.path.join(base_dir, module_path)
+        candidates.append(f"{base}.py")
+        candidates.append(os.path.join(base, "__init__.py"))
+    else:
+        candidates.append(os.path.join(base_dir, "__init__.py"))
+    return [c for c in candidates if os.path.isfile(c) and is_within_root(c, project_root)]
+
+
+def resolve_python_imports(path: str, project_root: str) -> list[str]:
+    if not project_root:
+        return []
+    text = read_text(path)
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    file_dir = os.path.dirname(path)
+    results: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                results.update(
+                    resolve_python_module(alias.name, 0, file_dir, project_root)
+                )
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            level = node.level or 0
+            results.update(resolve_python_module(module, level, file_dir, project_root))
+            for alias in node.names:
+                name = f"{module}.{alias.name}" if module else alias.name
+                results.update(resolve_python_module(name, level, file_dir, project_root))
+    return sorted(results)
+
+
+JS_IMPORT_RE = re.compile(
+    r"(?:import\s+(?:.+?\s+from\s+)?|export\s+(?:.+?\s+from\s+)?|import\s*\(|require\s*\()"
+    r"\s*['\"]([^'\"]+)['\"]"
+)
+
+
+def resolve_js_imports(path: str, project_root: str) -> list[str]:
+    if not project_root:
+        return []
+    text = read_text(path)
+    file_dir = os.path.dirname(path)
+    results: set[str] = set()
+    exts = [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".json"]
+    for match in JS_IMPORT_RE.findall(text):
+        if not match.startswith((".", "/")):
+            continue
+        base = (
+            os.path.join(project_root, match.lstrip("/"))
+            if match.startswith("/")
+            else os.path.join(file_dir, match)
+        )
+        candidates: list[str] = []
+        if os.path.splitext(base)[1]:
+            candidates.append(base)
+        else:
+            for ext in exts:
+                candidates.append(base + ext)
+            for ext in exts:
+                candidates.append(os.path.join(base, f"index{ext}"))
+        for candidate in candidates:
+            if os.path.isfile(candidate) and is_within_root(candidate, project_root):
+                results.add(candidate)
+    return sorted(results)
+
+
+def expand_dependencies(
+    seed_files: list[str], project_root: str, depth: int
+) -> list[str]:
+    if depth <= 0:
+        return seed_files
+    resolved: set[str] = set()
+    frontier = [path for path in seed_files if os.path.isfile(path)]
+    for path in frontier:
+        resolved.add(path)
+    for _ in range(depth):
+        next_frontier: list[str] = []
+        for path in frontier:
+            ext = os.path.splitext(path)[1].lower()
+            deps: list[str] = []
+            if ext == ".py":
+                deps = resolve_python_imports(path, project_root)
+            elif ext in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+                deps = resolve_js_imports(path, project_root)
+            for dep in deps:
+                if dep not in resolved:
+                    resolved.add(dep)
+                    next_frontier.append(dep)
+        if not next_frontier:
+            break
+        frontier = next_frontier
+    return sorted(resolved)
+
+
+def build_context_bundle(
+    *,
+    run_dir: str,
+    project_root: str,
+    cwd_path: str,
+    changed_files: list[str],
+    config: dict[str, str],
+) -> tuple[str, str]:
+    enabled = parse_bool(
+        config.get("REVIEWER_CONTEXT") or os.environ.get("REVIEWER_CONTEXT"),
+        True,
+    )
+    if not enabled:
+        return "", ""
+    max_bytes = parse_int(
+        config.get("REVIEWER_CONTEXT_MAX_BYTES")
+        or os.environ.get("REVIEWER_CONTEXT_MAX_BYTES"),
+        500_000,
+    )
+    depth = parse_int(
+        config.get("REVIEWER_CONTEXT_DEPTH")
+        or os.environ.get("REVIEWER_CONTEXT_DEPTH"),
+        2,
+    )
+    if max_bytes <= 0:
+        return "", ""
+
+    root = os.path.abspath(project_root or cwd_path)
+    abs_changed: list[str] = []
+    deleted_entries: list[tuple[str, str]] = []
+    for raw in changed_files:
+        if not raw:
+            continue
+        abs_path = normalize_path(raw, cwd_path)
+        if os.path.isfile(abs_path):
+            abs_changed.append(abs_path)
+        else:
+            snap_path = os.path.join(run_dir, "before", abs_path.lstrip("/"))
+            if os.path.isfile(snap_path):
+                deleted_entries.append((snap_path, f"{abs_path} (before deleted)"))
+
+    adjacent_files = list_adjacent_context_files(abs_changed, root)
+    infra_files = list_infra_files(root)
+    test_files = list_test_files(root, abs_changed)
+    deps = expand_dependencies(abs_changed, root, depth)
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def add_paths(paths: list[str]) -> None:
+        for path in paths:
+            if not path or path in seen or not os.path.isfile(path):
+                continue
+            ordered.append(path)
+            seen.add(path)
+
+    add_paths(abs_changed)
+    add_paths(adjacent_files)
+    add_paths(test_files)
+    add_paths(infra_files)
+    add_paths([path for path in deps if path not in seen])
+
+    entries: list[tuple[str, str]] = [
+        (path, display_path(path, root)) for path in ordered
+    ]
+    for snap_path, label in deleted_entries:
+        if snap_path not in seen:
+            entries.append((snap_path, label))
+            seen.add(snap_path)
+
+    context_file = os.path.join(run_dir, "context.txt")
+    context_files_file = os.path.join(run_dir, "context.files")
+    included_labels: list[str] = []
+    total = 0
+    truncated = False
+    with open(context_file, "w", encoding="utf-8") as out:
+        for path, label in entries:
+            if not is_text_file(path):
+                continue
+            header = f"FILE: {label}\n"
+            remaining = max_bytes - total
+            if remaining <= len(header):
+                truncated = True
+                break
+            out.write(header)
+            total += len(header)
+            content, clipped = read_text_limited(path, remaining - len(header))
+            out.write(content)
+            out.write("\n\n")
+            total += len(content) + 2
+            included_labels.append(label)
+            if clipped:
+                truncated = True
+                out.write("[context truncated to fit budget]\n")
+                break
+        if truncated:
+            out.write("[context truncated: increase REVIEWER_CONTEXT_MAX_BYTES to include more]\n")
+
+    if included_labels:
+        write_text(context_files_file, "\n".join(included_labels) + "\n")
+    else:
+        write_text(context_files_file, "")
+    return context_file, context_files_file
 
 
 def extract_review_field(path: str, label: str) -> str:
@@ -298,10 +711,20 @@ def append_diff(
         append_text(diff_file, result.stdout)
 
 
-def run_codex(review_prompt: str, diff: str, codex_out: str, base_dir: str) -> None:
+def run_codex(
+    review_prompt: str,
+    diff: str,
+    codex_out: str,
+    base_dir: str,
+    context_file: str,
+    project_root: str,
+) -> None:
     if not shutil.which("codex"):
         return
+    context_text = read_text(context_file) if context_file else ""
     input_text = f"{review_prompt}\n\nDIFF:\n{diff}\n"
+    if context_text:
+        input_text += f"\nCONTEXT:\n{context_text}\n"
     cmd = [
         "codex",
         "exec",
@@ -311,30 +734,42 @@ def run_codex(review_prompt: str, diff: str, codex_out: str, base_dir: str) -> N
         codex_out,
         "-",
     ]
+    if project_root and os.path.isdir(project_root):
+        cmd[2:2] = ["-C", project_root]
     subprocess.run(cmd, input=input_text, text=True, check=False)
     if os.path.isfile(codex_out):
         shutil.copyfile(codex_out, os.path.join(base_dir, "latest.codex.md"))
 
 
 def run_claude(
-    review_prompt: str, diff_file: str, run_dir: str, claude_out: str, base_dir: str
+    review_prompt: str,
+    diff_file: str,
+    run_dir: str,
+    claude_out: str,
+    base_dir: str,
+    context_file: str,
+    project_root: str,
 ) -> None:
     if not shutil.which("claude"):
         return
-    prompt = f"Review the diff at {diff_file}. Use the following format:\n{review_prompt}"
+    prompt = f"Review the diff at {diff_file}."
+    if context_file:
+        prompt += f" Additional context is available at {context_file}."
+    prompt += f" Use the following format:\n{review_prompt}"
     cmd = [
         "claude",
         "-p",
         "--permission-mode",
         "bypassPermissions",
         "--tools",
-        "Read",
+        "Read,Glob,WebSearch,WebFetch",
         "--add-dir",
         run_dir,
-        prompt,
     ]
+    if project_root and os.path.isdir(project_root):
+        cmd.extend(["--add-dir", project_root])
     with open(claude_out, "w", encoding="utf-8") as out:
-        subprocess.run(cmd, stdout=out, text=True, check=False)
+        subprocess.run(cmd, input=prompt, stdout=out, text=True, check=False)
     if os.path.isfile(claude_out):
         shutil.copyfile(claude_out, os.path.join(base_dir, "latest.claude.md"))
 
@@ -355,10 +790,13 @@ def write_run_log(
     backend: str,
     codex_out: str,
     claude_out: str,
+    context_file: str,
+    context_files_file: str,
     log_file: str,
 ) -> None:
     files = [line for line in read_lines(files_file) if line]
     diff_content = read_text(diff_file)
+    context_files = [line for line in read_lines(context_files_file) if line]
 
     with open(log_md, "w", encoding="utf-8") as f:
         f.write(f"timestamp: {prompt_ts}\n")
@@ -373,6 +811,12 @@ def write_run_log(
         f.write("files:\n")
         for line in files:
             f.write(f"- {line}\n")
+        if context_files:
+            f.write("context_files:\n")
+            for line in context_files:
+                f.write(f"- {line}\n")
+        if context_file and os.path.isfile(context_file):
+            f.write(f"context_bundle: {context_file}\n")
         f.write("\n")
         f.write("diff:\n")
         f.write("```diff\n")
@@ -404,6 +848,8 @@ def write_run_log(
         "backend": backend,
         "codex_output": codex_out,
         "claude_output": claude_out,
+        "context_file": context_file if os.path.isfile(context_file) else "",
+        "context_files": context_files,
     }
 
     if update_json and os.path.exists(log_file):
@@ -444,6 +890,7 @@ def main() -> int:
     prompt_text = json_get(data, "prompt")
 
     cwd_path = os.path.abspath(cwd) if cwd else os.getcwd()
+    project_root = find_project_root(cwd_path) or cwd_path
     config_file = resolve_config_path(cwd_path)
     config = parse_config(config_file)
     backend = config.get("REVIEWER_BACKEND") or os.environ.get("REVIEWER_BACKEND", "codex")
@@ -473,8 +920,10 @@ def main() -> int:
 
     review_prompt = (
         "You are a strict reviewer. Find correctness bugs, security issues, "
-        "behavior regressions, and missing tests. Review only the diff below "
-        "(changes from the current prompt). Respond with:\n"
+        "behavior regressions, and missing tests. The diff is the source of truth; "
+        "use any provided context files only to interpret the diff, not to review "
+        "unrelated code. IMPORTANT: Verify every claim. IMPORTANT: Use web search if "
+        "needed to validate specifics. Respond with:\n"
         "BLOCKERS: <list or 'none'>\n"
         "NOTES: <short list of improvements>"
     )
@@ -556,6 +1005,8 @@ def main() -> int:
             codex_out = os.path.join(run_dir, "review.codex.md")
             claude_out = os.path.join(run_dir, "review.claude.md")
             log_md = os.path.join(run_dir, "review.log.md")
+            context_file = os.path.join(run_dir, "context.txt")
+            context_files_file = os.path.join(run_dir, "context.files")
             update_json = os.path.exists(log_md)
             write_run_log(
                 log_md,
@@ -572,6 +1023,8 @@ def main() -> int:
                 backend=backend,
                 codex_out=codex_out,
                 claude_out=claude_out,
+                context_file=context_file,
+                context_files_file=context_files_file,
                 log_file=log_file,
             )
             if os.path.exists(pending_run_file):
@@ -646,14 +1099,52 @@ def main() -> int:
         gate_question = read_text(gate_question_file).strip()
         codex_out = os.path.join(run_dir, "review.codex.md")
         claude_out = os.path.join(run_dir, "review.claude.md")
+        changed_files = [line for line in read_lines(files_file) if line]
+        context_file, context_files_file = build_context_bundle(
+            run_dir=run_dir,
+            project_root=project_root,
+            cwd_path=cwd_path,
+            changed_files=changed_files,
+            config=config,
+        )
 
         if backend == "codex":
-            run_codex(review_prompt, diff, codex_out, base_dir)
+            run_codex(
+                review_prompt,
+                diff,
+                codex_out,
+                base_dir,
+                context_file,
+                project_root,
+            )
         elif backend == "claude":
-            run_claude(review_prompt, diff_file, run_dir, claude_out, base_dir)
+            run_claude(
+                review_prompt,
+                diff_file,
+                run_dir,
+                claude_out,
+                base_dir,
+                context_file,
+                project_root,
+            )
         elif backend == "both":
-            run_codex(review_prompt, diff, codex_out, base_dir)
-            run_claude(review_prompt, diff_file, run_dir, claude_out, base_dir)
+            run_codex(
+                review_prompt,
+                diff,
+                codex_out,
+                base_dir,
+                context_file,
+                project_root,
+            )
+            run_claude(
+                review_prompt,
+                diff_file,
+                run_dir,
+                claude_out,
+                base_dir,
+                context_file,
+                project_root,
+            )
         else:
             return 0
 
@@ -676,6 +1167,8 @@ def main() -> int:
                 backend=backend,
                 codex_out=codex_out,
                 claude_out=claude_out,
+                context_file=context_file,
+                context_files_file=context_files_file,
                 log_file=log_file,
             )
             if os.path.exists(pending_run_file):
@@ -707,7 +1200,8 @@ def main() -> int:
             )
             sys.stderr.write(
                 "\nUSER REQUEST (MANDATORY): Call AskUserQuestion now with this question: "
-                f'"{review_question}" This is a user request. Do not proceed until the user answers.\n'
+                f'"{review_question}" '
+                "This is a user request. Do not proceed until the user answers.\n"
             )
             return 2
 
