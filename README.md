@@ -69,6 +69,8 @@ See `config/reviewer.conf` for defaults and supported values.
 | `REVIEWER_CONTEXT` | `1` | `0`, `1` | Whether to build a context bundle for diff-first reviews. |
 | `REVIEWER_CONTEXT_MAX_BYTES` | `500000` | Any integer | Max size of the context bundle in bytes (raise to include more context). |
 | `REVIEWER_CONTEXT_DEPTH` | `2` | Any integer | Dependency expansion depth for local imports. |
+| `REVIEWER_CONFIDENCE_THRESHOLD` | `70` | `0-100` | Minimum confidence score to block on a finding. Findings below threshold are logged but won't block. |
+| `REVIEWER_MULTI_PASS` | `1` | `0`, `1` | Enable two-pass review: smoke check (fast, obvious issues) then semantic pass (deep analysis). |
 | `LATCHLINE_LOG_DIR` | `/tmp` | Any path | Base directory for logs/state/runs (created if missing, falls back to `/tmp` on failure). |
 
 ## Development

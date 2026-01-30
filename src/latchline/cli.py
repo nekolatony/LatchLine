@@ -8,8 +8,36 @@ import re
 import shutil
 import subprocess
 import sys
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+
+
+@dataclass
+class Finding:
+    id: str
+    severity: str  # critical|high|medium|low|info
+    category: str  # correctness|security|regression|missing_test|style|performance
+    confidence: int  # 0-100
+    title: str
+    description: str
+    file_path: str | None = None
+    line_start: int | None = None
+    line_end: int | None = None
+    suggested_fix: str | None = None
+    pass_number: int = 1
+
+
+@dataclass
+class ReviewResult:
+    version: str = "1.0"
+    timestamp: str = ""
+    backend: str = ""
+    pass_number: int = 1
+    pass_type: str = "smoke"  # smoke|semantic
+    findings: list[Finding] = field(default_factory=list)
+    blockers_summary: str = ""
+    notes_summary: str = ""
 
 
 def read_json_stdin() -> dict[str, Any]:
@@ -595,6 +623,238 @@ def build_review_question(backend: str, codex_out: str, claude_out: str) -> str:
     return question
 
 
+SMOKE_FOCUS = (
+    "Focus on obvious issues: syntax errors, clear security flaws, obvious logic bugs, "
+    "missing null checks. Be fast and surface-level."
+)
+
+SEMANTIC_FOCUS = (
+    "Perform deep semantic analysis: trace data flow, verify invariants, check edge cases, "
+    "validate error handling, assess test coverage."
+)
+
+STRUCTURED_REVIEW_TEMPLATE = """You are a strict code reviewer. {pass_focus}
+
+The diff is the source of truth; use context files only to interpret the diff.
+IMPORTANT: Verify every claim. Use web search if needed.
+
+Respond with ONLY valid JSON in this exact format:
+{{
+  "findings": [
+    {{
+      "id": "F001",
+      "severity": "critical|high|medium|low|info",
+      "category": "correctness|security|regression|missing_test|style|performance",
+      "confidence": 0-100,
+      "title": "Short issue title",
+      "description": "Detailed explanation",
+      "file_path": "path/to/file.py or null",
+      "line_start": 42 or null,
+      "line_end": 45 or null,
+      "suggested_fix": "Code or guidance, or null"
+    }}
+  ],
+  "blockers_summary": "List of blocking issues or 'none'",
+  "notes_summary": "List of non-blocking improvements"
+}}
+
+Confidence guidelines:
+- 90-100: Certain - verified via docs/search or obvious from code
+- 70-89: High - strong evidence in diff/context
+- 50-69: Medium - likely but needs verification
+- 30-49: Low - possible issue, uncertain
+- 0-29: Speculative - mention for awareness only"""
+
+
+def build_structured_review_prompt(pass_type: str) -> str:
+    """Build prompt requesting JSON output with findings schema."""
+    if pass_type == "smoke":
+        return STRUCTURED_REVIEW_TEMPLATE.format(pass_focus=SMOKE_FOCUS)
+    return STRUCTURED_REVIEW_TEMPLATE.format(pass_focus=SEMANTIC_FOCUS)
+
+
+def parse_structured_output(raw_output: str, pass_number: int, backend: str) -> ReviewResult:
+    """Parse JSON from reviewer output, fallback to legacy parsing."""
+    result = ReviewResult(
+        timestamp=utc_now(),
+        backend=backend,
+        pass_number=pass_number,
+        pass_type="smoke" if pass_number == 1 else "semantic",
+    )
+    text = raw_output.strip()
+    json_match = re.search(r'\{[\s\S]*\}', text)
+    if not json_match:
+        return parse_legacy_output(raw_output, pass_number, backend)
+    try:
+        data = json.loads(json_match.group())
+    except json.JSONDecodeError:
+        return parse_legacy_output(raw_output, pass_number, backend)
+    findings_data = data.get("findings", [])
+    if not isinstance(findings_data, list):
+        return parse_legacy_output(raw_output, pass_number, backend)
+    findings: list[Finding] = []
+    for i, f in enumerate(findings_data):
+        if not isinstance(f, dict):
+            continue
+        raw_severity = str(f.get("severity", "info")).lower()
+        valid_severities = {"critical", "high", "medium", "low", "info"}
+        severity = raw_severity if raw_severity in valid_severities else "info"
+        raw_category = str(f.get("category", "correctness")).lower()
+        valid_categories = {
+            "correctness", "security", "regression",
+            "missing_test", "style", "performance"
+        }
+        category = raw_category if raw_category in valid_categories else "correctness"
+        finding = Finding(
+            id=str(f.get("id", f"F{i+1:03d}")),
+            severity=severity,
+            category=category,
+            confidence=max(0, min(100, (
+                int(f.get("confidence", 50))
+                if isinstance(f.get("confidence"), (int, float)) else 50
+            ))),
+            title=str(f.get("title", "")),
+            description=str(f.get("description", "")),
+            file_path=f.get("file_path") if f.get("file_path") else None,
+            line_start=int(f["line_start"]) if f.get("line_start") else None,
+            line_end=int(f["line_end"]) if f.get("line_end") else None,
+            suggested_fix=f.get("suggested_fix") if f.get("suggested_fix") else None,
+            pass_number=pass_number,
+        )
+        findings.append(finding)
+    result.findings = findings
+    result.blockers_summary = str(data.get("blockers_summary", ""))
+    result.notes_summary = str(data.get("notes_summary", ""))
+    return result
+
+
+def parse_legacy_output(raw_output: str, pass_number: int, backend: str) -> ReviewResult:
+    """Parse BLOCKERS:/NOTES: format into ReviewResult."""
+    result = ReviewResult(
+        timestamp=utc_now(),
+        backend=backend,
+        pass_number=pass_number,
+        pass_type="smoke" if pass_number == 1 else "semantic",
+    )
+    re_flags = re.MULTILINE | re.DOTALL | re.IGNORECASE
+    blockers_match = re.search(r'^BLOCKERS:\s*(.+?)(?=^NOTES:|$)', raw_output, re_flags)
+    notes_match = re.search(r'^NOTES:\s*(.+?)$', raw_output, re_flags)
+    blockers_text = blockers_match.group(1).strip() if blockers_match else ""
+    notes_text = notes_match.group(1).strip() if notes_match else ""
+    result.blockers_summary = blockers_text or "none"
+    result.notes_summary = notes_text or "none"
+    if blockers_text and blockers_text.lower() != "none":
+        finding = Finding(
+            id="F001",
+            severity="high",
+            category="correctness",
+            confidence=70,
+            title="Legacy blocker",
+            description=blockers_text,
+            pass_number=pass_number,
+        )
+        result.findings.append(finding)
+    return result
+
+
+def write_structured_json(run_dir: str, results: list[ReviewResult]) -> str:
+    """Write review.structured.json with all findings."""
+    output_path = os.path.join(run_dir, "review.structured.json")
+    all_findings: list[dict[str, Any]] = []
+    passes: list[dict[str, Any]] = []
+    for result in results:
+        if result is None:
+            continue
+        pass_data = {
+            "backend": result.backend,
+            "pass_type": result.pass_type,
+            "pass_number": result.pass_number,
+            "blockers_summary": result.blockers_summary,
+            "notes_summary": result.notes_summary,
+            "findings_count": len(result.findings),
+        }
+        passes.append(pass_data)
+        for finding in result.findings:
+            all_findings.append(asdict(finding))
+    output = {
+        "version": "1.0",
+        "generated_at": utc_now(),
+        "passes": passes,
+        "all_findings": all_findings,
+    }
+    write_text(output_path, json.dumps(output, indent=2) + "\n")
+    return output_path
+
+
+def format_finding_for_display(finding: Finding) -> str:
+    """Human-readable finding format for stderr output."""
+    location = ""
+    if finding.file_path:
+        location = f" [{finding.file_path}"
+        if finding.line_start:
+            location += f":{finding.line_start}"
+            if finding.line_end and finding.line_end != finding.line_start:
+                location += f"-{finding.line_end}"
+        location += "]"
+    return (
+        f"[{finding.severity.upper()}] ({finding.confidence}%) {finding.title}{location}\n"
+        f"  {finding.description}"
+    )
+
+
+def has_blocking_findings(result: ReviewResult, threshold: int) -> bool:
+    """True if any critical/high finding has confidence >= threshold."""
+    for finding in result.findings:
+        if finding.severity in ("critical", "high") and finding.confidence >= threshold:
+            return True
+    return False
+
+
+def get_blocking_findings(result: ReviewResult, threshold: int) -> list[Finding]:
+    """Get findings that meet blocking criteria."""
+    return [
+        f for f in result.findings
+        if f.severity in ("critical", "high") and f.confidence >= threshold
+    ]
+
+
+def build_review_question_structured(results: list[ReviewResult], threshold: int) -> str:
+    """Build gate question showing confidence scores."""
+    blocking: list[Finding] = []
+    notes: list[Finding] = []
+    for result in results:
+        if result is None:
+            continue
+        for finding in result.findings:
+            if finding.severity in ("critical", "high") and finding.confidence >= threshold:
+                blocking.append(finding)
+            else:
+                notes.append(finding)
+    if blocking:
+        blockers_str = "; ".join(
+            f"{f.title} ({f.confidence}% confidence)" for f in blocking[:3]
+        )
+        if len(blocking) > 3:
+            blockers_str += f" +{len(blocking) - 3} more"
+    else:
+        blockers_str = "none"
+    if notes:
+        notes_str = f"{len(notes)} non-blocking items"
+    else:
+        notes_str = "none"
+    summary = (
+        f"Review complete. Blockers (>={threshold}% confidence): "
+        f"{blockers_str}. Notes: {notes_str}."
+    )
+    question = (
+        f"{summary} I should apply the review feedback now and continue. Do you "
+        "agree? Reply with review:apply to proceed, or review:skip to skip reviews "
+        "for the rest of this session (you can re-enable later with review:enable "
+        "or review:resume)."
+    )
+    return re.sub(r"\s+", " ", question).strip()
+
+
 def review_has_blockers(path: str) -> bool:
     if not os.path.isfile(path):
         return False
@@ -774,6 +1034,160 @@ def run_claude(
         shutil.copyfile(claude_out, os.path.join(base_dir, "latest.claude.md"))
 
 
+def run_codex_structured(
+    pass_type: str,
+    diff: str,
+    output_file: str,
+    base_dir: str,
+    context_file: str,
+    project_root: str,
+) -> ReviewResult | None:
+    """Run Codex with structured JSON prompt and parse result."""
+    if not shutil.which("codex"):
+        return None
+    prompt = build_structured_review_prompt(pass_type)
+    context_text = read_text(context_file) if context_file else ""
+    input_text = f"{prompt}\n\nDIFF:\n{diff}\n"
+    if context_text:
+        input_text += f"\nCONTEXT:\n{context_text}\n"
+    cmd = [
+        "codex",
+        "exec",
+        "--sandbox",
+        "read-only",
+        "--output-last-message",
+        output_file,
+        "-",
+    ]
+    if project_root and os.path.isdir(project_root):
+        cmd[2:2] = ["-C", project_root]
+    subprocess.run(cmd, input=input_text, text=True, check=False)
+    if os.path.isfile(output_file):
+        shutil.copyfile(output_file, os.path.join(base_dir, f"latest.codex.{pass_type}.md"))
+        raw_output = read_text(output_file)
+        return parse_structured_output(raw_output, 1 if pass_type == "smoke" else 2, "codex")
+    return None
+
+
+def run_claude_structured(
+    pass_type: str,
+    diff_file: str,
+    run_dir: str,
+    output_file: str,
+    base_dir: str,
+    context_file: str,
+    project_root: str,
+) -> ReviewResult | None:
+    """Run Claude with structured JSON prompt and parse result."""
+    if not shutil.which("claude"):
+        return None
+    review_prompt = build_structured_review_prompt(pass_type)
+    prompt = f"Review the diff at {diff_file}."
+    if context_file:
+        prompt += f" Additional context is available at {context_file}."
+    prompt += f" Use the following format:\n{review_prompt}"
+    cmd = [
+        "claude",
+        "-p",
+        "--permission-mode",
+        "bypassPermissions",
+        "--tools",
+        "Read,Glob,WebSearch,WebFetch",
+        "--add-dir",
+        run_dir,
+    ]
+    if project_root and os.path.isdir(project_root):
+        cmd.extend(["--add-dir", project_root])
+    with open(output_file, "w", encoding="utf-8") as out:
+        subprocess.run(cmd, input=prompt, stdout=out, text=True, check=False)
+    if os.path.isfile(output_file):
+        shutil.copyfile(output_file, os.path.join(base_dir, f"latest.claude.{pass_type}.md"))
+        raw_output = read_text(output_file)
+        return parse_structured_output(raw_output, 1 if pass_type == "smoke" else 2, "claude")
+    return None
+
+
+def run_multi_pass_review(
+    backend: str,
+    diff: str,
+    diff_file: str,
+    run_dir: str,
+    base_dir: str,
+    context_file: str,
+    project_root: str,
+    config: dict[str, str],
+) -> tuple[ReviewResult | None, ReviewResult | None]:
+    """Run two-pass review: smoke check first, then semantic if needed."""
+    confidence_threshold = parse_int(
+        config.get("REVIEWER_CONFIDENCE_THRESHOLD")
+        or os.environ.get("REVIEWER_CONFIDENCE_THRESHOLD"),
+        70,
+    )
+    smoke_result: ReviewResult | None = None
+    semantic_result: ReviewResult | None = None
+    if backend == "codex":
+        smoke_out = os.path.join(run_dir, "review.codex.smoke.md")
+        smoke_result = run_codex_structured(
+            "smoke", diff, smoke_out, base_dir, context_file, project_root
+        )
+        if smoke_result and has_blocking_findings(smoke_result, confidence_threshold):
+            return smoke_result, None
+        semantic_out = os.path.join(run_dir, "review.codex.semantic.md")
+        semantic_result = run_codex_structured(
+            "semantic", diff, semantic_out, base_dir, context_file, project_root
+        )
+    elif backend == "claude":
+        smoke_out = os.path.join(run_dir, "review.claude.smoke.md")
+        smoke_result = run_claude_structured(
+            "smoke", diff_file, run_dir, smoke_out, base_dir, context_file, project_root
+        )
+        if smoke_result and has_blocking_findings(smoke_result, confidence_threshold):
+            return smoke_result, None
+        semantic_out = os.path.join(run_dir, "review.claude.semantic.md")
+        semantic_result = run_claude_structured(
+            "semantic", diff_file, run_dir, semantic_out,
+            base_dir, context_file, project_root
+        )
+    elif backend == "both":
+        smoke_codex_out = os.path.join(run_dir, "review.codex.smoke.md")
+        smoke_codex = run_codex_structured(
+            "smoke", diff, smoke_codex_out, base_dir, context_file, project_root
+        )
+        smoke_claude_out = os.path.join(run_dir, "review.claude.smoke.md")
+        smoke_claude = run_claude_structured(
+            "smoke", diff_file, run_dir, smoke_claude_out,
+            base_dir, context_file, project_root
+        )
+        smoke_result = smoke_codex or smoke_claude
+        if smoke_result:
+            codex_findings = smoke_codex.findings if smoke_codex else []
+            claude_findings = smoke_claude.findings if smoke_claude else []
+            smoke_result.findings = codex_findings + claude_findings
+        has_codex_blockers = (
+            smoke_codex and has_blocking_findings(smoke_codex, confidence_threshold)
+        )
+        has_claude_blockers = (
+            smoke_claude and has_blocking_findings(smoke_claude, confidence_threshold)
+        )
+        if has_codex_blockers or has_claude_blockers:
+            return smoke_result, None
+        semantic_codex_out = os.path.join(run_dir, "review.codex.semantic.md")
+        semantic_codex = run_codex_structured(
+            "semantic", diff, semantic_codex_out, base_dir, context_file, project_root
+        )
+        semantic_claude_out = os.path.join(run_dir, "review.claude.semantic.md")
+        semantic_claude = run_claude_structured(
+            "semantic", diff_file, run_dir, semantic_claude_out,
+            base_dir, context_file, project_root
+        )
+        semantic_result = semantic_codex or semantic_claude
+        if semantic_result:
+            codex_findings = semantic_codex.findings if semantic_codex else []
+            claude_findings = semantic_claude.findings if semantic_claude else []
+            semantic_result.findings = codex_findings + claude_findings
+    return smoke_result, semantic_result
+
+
 def write_run_log(
     log_md: str,
     update_json: bool,
@@ -793,10 +1207,13 @@ def write_run_log(
     context_file: str,
     context_files_file: str,
     log_file: str,
+    structured_results: list[ReviewResult] | None = None,
 ) -> None:
     files = [line for line in read_lines(files_file) if line]
     diff_content = read_text(diff_file)
     context_files = [line for line in read_lines(context_files_file) if line]
+    run_dir = os.path.dirname(log_md)
+    structured_json = os.path.join(run_dir, "review.structured.json")
 
     with open(log_md, "w", encoding="utf-8") as f:
         f.write(f"timestamp: {prompt_ts}\n")
@@ -817,6 +1234,8 @@ def write_run_log(
                 f.write(f"- {line}\n")
         if context_file and os.path.isfile(context_file):
             f.write(f"context_bundle: {context_file}\n")
+        if os.path.isfile(structured_json):
+            f.write(f"structured_output: {structured_json}\n")
         f.write("\n")
         f.write("diff:\n")
         f.write("```diff\n")
@@ -832,10 +1251,37 @@ def write_run_log(
             f.write("claude_response:\n")
             f.write(read_text(claude_out))
             f.write("\n")
+        if structured_results:
+            f.write("\n## Structured Findings\n\n")
+            for result in structured_results:
+                if result is None:
+                    continue
+                f.write(f"### {result.backend} (Pass {result.pass_number}: {result.pass_type})\n")
+                if result.findings:
+                    for finding in result.findings:
+                        f.write(f"- **[{finding.severity.upper()}]** ({finding.confidence}%) ")
+                        f.write(f"{finding.title}")
+                        if finding.file_path:
+                            f.write(f" [{finding.file_path}")
+                            if finding.line_start:
+                                f.write(f":{finding.line_start}")
+                            f.write("]")
+                        f.write("\n")
+                else:
+                    f.write("No findings.\n")
+                f.write("\n")
 
     shutil.copyfile(log_md, os.path.join(os.path.dirname(log_file), "latest.log.md"))
 
-    entry = {
+    findings_summary: list[dict[str, Any]] = []
+    if structured_results:
+        for result in structured_results:
+            if result is None:
+                continue
+            for finding in result.findings:
+                findings_summary.append(asdict(finding))
+
+    entry: dict[str, Any] = {
         "timestamp": prompt_ts,
         "session_id": session_id,
         "prompt_id": int(prompt_id or 0),
@@ -850,6 +1296,8 @@ def write_run_log(
         "claude_output": claude_out,
         "context_file": context_file if os.path.isfile(context_file) else "",
         "context_files": context_files,
+        "structured_json": structured_json if os.path.isfile(structured_json) else "",
+        "findings": findings_summary,
     }
 
     if update_json and os.path.exists(log_file):
@@ -1091,6 +1539,16 @@ def main() -> int:
         if not os.path.isfile(diff_file) or os.path.getsize(diff_file) == 0:
             return 0
 
+        multi_pass = parse_bool(
+            config.get("REVIEWER_MULTI_PASS") or os.environ.get("REVIEWER_MULTI_PASS"),
+            True,
+        )
+        confidence_threshold = parse_int(
+            config.get("REVIEWER_CONFIDENCE_THRESHOLD")
+            or os.environ.get("REVIEWER_CONFIDENCE_THRESHOLD"),
+            70,
+        )
+
         diff = read_text(diff_file)
         prompt_ts = read_text(prompt_ts_file).strip() or utc_now()
         prompt_cwd = read_text(cwd_file).strip()
@@ -1108,45 +1566,71 @@ def main() -> int:
             config=config,
         )
 
-        if backend == "codex":
-            run_codex(
-                review_prompt,
-                diff,
-                codex_out,
-                base_dir,
-                context_file,
-                project_root,
+        structured_results: list[ReviewResult] = []
+        if multi_pass:
+            smoke, semantic = run_multi_pass_review(
+                backend, diff, diff_file, run_dir, base_dir,
+                context_file, project_root, config,
             )
-        elif backend == "claude":
-            run_claude(
-                review_prompt,
-                diff_file,
-                run_dir,
-                claude_out,
-                base_dir,
-                context_file,
-                project_root,
-            )
-        elif backend == "both":
-            run_codex(
-                review_prompt,
-                diff,
-                codex_out,
-                base_dir,
-                context_file,
-                project_root,
-            )
-            run_claude(
-                review_prompt,
-                diff_file,
-                run_dir,
-                claude_out,
-                base_dir,
-                context_file,
-                project_root,
-            )
+            if smoke:
+                structured_results.append(smoke)
+            if semantic:
+                structured_results.append(semantic)
         else:
-            return 0
+            if backend == "codex":
+                run_codex(
+                    review_prompt,
+                    diff,
+                    codex_out,
+                    base_dir,
+                    context_file,
+                    project_root,
+                )
+                if os.path.isfile(codex_out):
+                    result = parse_structured_output(read_text(codex_out), 1, "codex")
+                    structured_results.append(result)
+            elif backend == "claude":
+                run_claude(
+                    review_prompt,
+                    diff_file,
+                    run_dir,
+                    claude_out,
+                    base_dir,
+                    context_file,
+                    project_root,
+                )
+                if os.path.isfile(claude_out):
+                    result = parse_structured_output(read_text(claude_out), 1, "claude")
+                    structured_results.append(result)
+            elif backend == "both":
+                run_codex(
+                    review_prompt,
+                    diff,
+                    codex_out,
+                    base_dir,
+                    context_file,
+                    project_root,
+                )
+                run_claude(
+                    review_prompt,
+                    diff_file,
+                    run_dir,
+                    claude_out,
+                    base_dir,
+                    context_file,
+                    project_root,
+                )
+                if os.path.isfile(codex_out):
+                    result = parse_structured_output(read_text(codex_out), 1, "codex")
+                    structured_results.append(result)
+                if os.path.isfile(claude_out):
+                    result = parse_structured_output(read_text(claude_out), 1, "claude")
+                    structured_results.append(result)
+            else:
+                return 0
+
+        if structured_results:
+            write_structured_json(run_dir, structured_results)
 
         log_md = os.path.join(run_dir, "review.log.md")
         if block == "2" and not gate_action:
@@ -1170,6 +1654,7 @@ def main() -> int:
                 context_file=context_file,
                 context_files_file=context_files_file,
                 log_file=log_file,
+                structured_results=structured_results,
             )
             if os.path.exists(pending_run_file):
                 os.remove(pending_run_file)
@@ -1181,18 +1666,27 @@ def main() -> int:
             return 0
 
         if block == "2":
-            review_question = build_review_question(backend, codex_out, claude_out)
-            if backend == "both":
-                if os.path.isfile(codex_out):
-                    sys.stderr.write(f"CODEX REVIEW:\n{read_text(codex_out)}\n")
-                if os.path.isfile(claude_out):
-                    sys.stderr.write(f"CLAUDE REVIEW:\n{read_text(claude_out)}\n")
-            else:
-                review_file = codex_out if backend != "claude" else claude_out
-                if os.path.isfile(review_file):
-                    sys.stderr.write(read_text(review_file) + "\n")
+            review_question = build_review_question_structured(
+                structured_results, confidence_threshold
+            )
+            for result in structured_results:
+                if result is None:
+                    continue
+                header = (
+                    f"\n=== {result.backend.upper()} REVIEW "
+                    f"(Pass {result.pass_number}: {result.pass_type}) ===\n"
+                )
+                sys.stderr.write(header)
+                if result.findings:
+                    for finding in result.findings:
+                        sys.stderr.write(format_finding_for_display(finding) + "\n\n")
                 else:
-                    sys.stderr.write(f"Review completed; see {log_md}\n")
+                    sys.stderr.write("No findings.\n")
+                sys.stderr.write(f"Blockers: {result.blockers_summary}\n")
+                sys.stderr.write(f"Notes: {result.notes_summary}\n")
+            structured_json = os.path.join(run_dir, "review.structured.json")
+            if os.path.isfile(structured_json):
+                sys.stderr.write(f"\nStructured output: {structured_json}\n")
             sys.stderr.write(
                 "\nACTION REQUIRED: Reply with 'review:apply' to act on this feedback, "
                 "or 'review:skip' to skip reviews for the rest of this session. "
@@ -1206,15 +1700,17 @@ def main() -> int:
             return 2
 
         if block == "1":
-            if review_has_blockers(codex_out):
-                line = first_blockers_line(codex_out)
-                if line:
-                    sys.stderr.write(line + "\n")
-                return 2
-            if review_has_blockers(claude_out):
-                line = first_blockers_line(claude_out)
-                if line:
-                    sys.stderr.write(line + "\n")
+            blocking_found = any(
+                has_blocking_findings(r, confidence_threshold)
+                for r in structured_results if r
+            )
+            if blocking_found:
+                for result in structured_results:
+                    if result is None:
+                        continue
+                    blocking = get_blocking_findings(result, confidence_threshold)
+                    for finding in blocking:
+                        sys.stderr.write(format_finding_for_display(finding) + "\n")
                 return 2
 
         return 0

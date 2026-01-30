@@ -208,3 +208,165 @@ def test_build_context_bundle_includes_adjacent_context(tmp_path):
     assert "FILE: services/api/Dockerfile" in content
     listed = Path(context_files_file).read_text(encoding="utf-8")
     assert "services/api/Dockerfile" in listed
+
+
+def test_parse_structured_output_valid_json():
+    raw = '''
+    {
+      "findings": [
+        {
+          "id": "F001",
+          "severity": "high",
+          "category": "security",
+          "confidence": 85,
+          "title": "SQL injection",
+          "description": "User input passed to query",
+          "file_path": "src/db.py",
+          "line_start": 42,
+          "line_end": 42,
+          "suggested_fix": "Use parameterized query"
+        }
+      ],
+      "blockers_summary": "SQL injection found",
+      "notes_summary": "Consider adding tests"
+    }
+    '''
+    result = ai_review.parse_structured_output(raw, 1, "codex")
+    assert result.backend == "codex"
+    assert result.pass_number == 1
+    assert len(result.findings) == 1
+    finding = result.findings[0]
+    assert finding.id == "F001"
+    assert finding.severity == "high"
+    assert finding.confidence == 85
+    assert finding.file_path == "src/db.py"
+    assert result.blockers_summary == "SQL injection found"
+
+
+def test_parse_structured_output_fallback_legacy():
+    raw = """BLOCKERS: Missing null check in process()
+NOTES: Consider adding logging"""
+    result = ai_review.parse_structured_output(raw, 1, "claude")
+    assert result.backend == "claude"
+    assert "Missing null check" in result.blockers_summary
+    assert "logging" in result.notes_summary
+    assert len(result.findings) == 1
+    assert result.findings[0].severity == "high"
+
+
+def test_has_blocking_findings_respects_threshold():
+    finding_high_conf = ai_review.Finding(
+        id="F001", severity="high", category="security",
+        confidence=85, title="Issue", description="Desc",
+    )
+    finding_low_conf = ai_review.Finding(
+        id="F002", severity="high", category="security",
+        confidence=50, title="Issue", description="Desc",
+    )
+    result = ai_review.ReviewResult(findings=[finding_high_conf, finding_low_conf])
+    assert ai_review.has_blocking_findings(result, 70) is True
+    assert ai_review.has_blocking_findings(result, 90) is False
+
+
+def test_has_blocking_findings_ignores_low_severity():
+    finding = ai_review.Finding(
+        id="F001", severity="low", category="style",
+        confidence=95, title="Style issue", description="Desc",
+    )
+    result = ai_review.ReviewResult(findings=[finding])
+    assert ai_review.has_blocking_findings(result, 70) is False
+
+
+def test_format_finding_for_display():
+    finding = ai_review.Finding(
+        id="F001", severity="critical", category="security",
+        confidence=92, title="SQL Injection",
+        description="User input passed directly",
+        file_path="src/db.py", line_start=42, line_end=45,
+    )
+    output = ai_review.format_finding_for_display(finding)
+    assert "[CRITICAL]" in output
+    assert "(92%)" in output
+    assert "SQL Injection" in output
+    assert "[src/db.py:42-45]" in output
+    assert "User input passed directly" in output
+
+
+def test_get_blocking_findings():
+    f1 = ai_review.Finding(
+        id="F001", severity="critical", category="security",
+        confidence=90, title="A", description=""
+    )
+    f2 = ai_review.Finding(
+        id="F002", severity="high", category="correctness",
+        confidence=60, title="B", description=""
+    )
+    f3 = ai_review.Finding(
+        id="F003", severity="low", category="style",
+        confidence=95, title="C", description=""
+    )
+    result = ai_review.ReviewResult(findings=[f1, f2, f3])
+    blocking = ai_review.get_blocking_findings(result, 70)
+    assert len(blocking) == 1
+    assert blocking[0].id == "F001"
+
+
+def test_parse_structured_output_validates_values():
+    raw = '''
+    {
+      "findings": [
+        {
+          "id": "F001",
+          "severity": "UNKNOWN",
+          "category": "invalid_category",
+          "confidence": 150,
+          "title": "Test",
+          "description": "Desc"
+        },
+        {
+          "id": "F002",
+          "severity": "critical",
+          "category": "security",
+          "confidence": -10,
+          "title": "Test2",
+          "description": "Desc2"
+        }
+      ],
+      "blockers_summary": "test",
+      "notes_summary": "test"
+    }
+    '''
+    result = ai_review.parse_structured_output(raw, 1, "codex")
+    assert len(result.findings) == 2
+    # Invalid severity defaults to "info"
+    assert result.findings[0].severity == "info"
+    # Invalid category defaults to "correctness"
+    assert result.findings[0].category == "correctness"
+    # Confidence > 100 clamped to 100
+    assert result.findings[0].confidence == 100
+    # Confidence < 0 clamped to 0
+    assert result.findings[1].confidence == 0
+    # Valid values preserved
+    assert result.findings[1].severity == "critical"
+    assert result.findings[1].category == "security"
+
+
+def test_write_structured_json(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    finding = ai_review.Finding(
+        id="F001", severity="high", category="security",
+        confidence=85, title="Issue", description="Desc",
+    )
+    result = ai_review.ReviewResult(
+        backend="codex", pass_type="smoke", pass_number=1,
+        findings=[finding], blockers_summary="Issue found", notes_summary="none",
+    )
+    output_path = ai_review.write_structured_json(str(run_dir), [result])
+    assert Path(output_path).exists()
+    import json
+    data = json.loads(Path(output_path).read_text())
+    assert data["version"] == "1.0"
+    assert len(data["passes"]) == 1
+    assert len(data["all_findings"]) == 1
+    assert data["all_findings"][0]["confidence"] == 85
