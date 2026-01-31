@@ -40,6 +40,36 @@ class ReviewResult:
     notes_summary: str = ""
 
 
+@dataclass
+class DiffLine:
+    """A single line in a diff hunk."""
+    line_type: str  # context|add|remove
+    content: str
+    old_line: int | None = None
+    new_line: int | None = None
+    finding_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class DiffHunk:
+    """A single hunk in a unified diff."""
+    file_path: str
+    old_start: int
+    old_count: int
+    new_start: int
+    new_count: int
+    header: str
+    lines: list[DiffLine] = field(default_factory=list)
+
+
+@dataclass
+class AnnotatedDiff:
+    """A complete diff with findings mapped to lines."""
+    hunks: list[DiffHunk] = field(default_factory=list)
+    finding_line_map: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
+    unlocated_findings: list[Finding] = field(default_factory=list)
+
+
 def read_json_stdin() -> dict[str, Any]:
     raw = sys.stdin.read()
     if not raw.strip():
@@ -757,8 +787,12 @@ def parse_legacy_output(raw_output: str, pass_number: int, backend: str) -> Revi
     return result
 
 
-def write_structured_json(run_dir: str, results: list[ReviewResult]) -> str:
-    """Write review.structured.json with all findings."""
+def write_structured_json(
+    run_dir: str,
+    results: list[ReviewResult],
+    annotated_diff: AnnotatedDiff | None = None,
+) -> str:
+    """Write review.structured.json with all findings and diff mapping."""
     output_path = os.path.join(run_dir, "review.structured.json")
     all_findings: list[dict[str, Any]] = []
     passes: list[dict[str, Any]] = []
@@ -776,12 +810,17 @@ def write_structured_json(run_dir: str, results: list[ReviewResult]) -> str:
         passes.append(pass_data)
         for finding in result.findings:
             all_findings.append(asdict(finding))
-    output = {
+    output: dict[str, Any] = {
         "version": "1.0",
         "generated_at": utc_now(),
         "passes": passes,
         "all_findings": all_findings,
     }
+    if annotated_diff:
+        output["finding_line_map"] = annotated_diff.finding_line_map
+        output["unlocated_finding_ids"] = [
+            f.id for f in annotated_diff.unlocated_findings
+        ]
     write_text(output_path, json.dumps(output, indent=2) + "\n")
     return output_path
 
@@ -800,6 +839,255 @@ def format_finding_for_display(finding: Finding) -> str:
         f"[{finding.severity.upper()}] ({finding.confidence}%) {finding.title}{location}\n"
         f"  {finding.description}"
     )
+
+
+# Diff highlighting regex patterns
+DIFF_FILE_HEADER_RE = re.compile(r'^diff --git a/(.+) b/(.+)$')
+DIFF_HUNK_HEADER_RE = re.compile(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@')
+
+
+def parse_unified_diff(diff_text: str) -> list[DiffHunk]:
+    """Parse unified diff format into structured DiffHunk objects."""
+    hunks: list[DiffHunk] = []
+    current_file: str = ""
+    current_hunk: DiffHunk | None = None
+    old_line = 0
+    new_line = 0
+    for line in diff_text.splitlines():
+        file_match = DIFF_FILE_HEADER_RE.match(line)
+        if file_match:
+            current_file = file_match.group(2)
+            continue
+        if line.startswith('--- ') or line.startswith('+++ '):
+            if line.startswith('+++ '):
+                path = line[4:].strip()
+                # Strip LatchLine's (before)/(after) labels
+                for suffix in (' (after)', ' (before)', ' (deleted)'):
+                    if path.endswith(suffix):
+                        path = path[:-len(suffix)]
+                        break
+                if path.startswith('b/'):
+                    current_file = path[2:]
+                elif path != '/dev/null':
+                    current_file = path
+            continue
+        hunk_match = DIFF_HUNK_HEADER_RE.match(line)
+        if hunk_match:
+            if current_hunk:
+                hunks.append(current_hunk)
+            old_start = int(hunk_match.group(1))
+            old_count = int(hunk_match.group(2)) if hunk_match.group(2) else 1
+            new_start = int(hunk_match.group(3))
+            new_count = int(hunk_match.group(4)) if hunk_match.group(4) else 1
+            current_hunk = DiffHunk(
+                file_path=current_file,
+                old_start=old_start,
+                old_count=old_count,
+                new_start=new_start,
+                new_count=new_count,
+                header=line,
+            )
+            old_line = old_start
+            new_line = new_start
+            continue
+        if current_hunk is None:
+            continue
+        if line.startswith('+') and not line.startswith('+++'):
+            diff_line = DiffLine(
+                line_type="add",
+                content=line[1:],
+                old_line=None,
+                new_line=new_line,
+            )
+            current_hunk.lines.append(diff_line)
+            new_line += 1
+        elif line.startswith('-') and not line.startswith('---'):
+            diff_line = DiffLine(
+                line_type="remove",
+                content=line[1:],
+                old_line=old_line,
+                new_line=None,
+            )
+            current_hunk.lines.append(diff_line)
+            old_line += 1
+        elif line.startswith(' ') or line == '':
+            content = line[1:] if line.startswith(' ') else ''
+            diff_line = DiffLine(
+                line_type="context",
+                content=content,
+                old_line=old_line,
+                new_line=new_line,
+            )
+            current_hunk.lines.append(diff_line)
+            old_line += 1
+            new_line += 1
+    if current_hunk:
+        hunks.append(current_hunk)
+    return hunks
+
+
+def map_findings_to_diff(
+    findings: list[Finding], hunks: list[DiffHunk]
+) -> AnnotatedDiff:
+    """Map findings to diff lines based on file_path and line numbers."""
+    annotated = AnnotatedDiff(hunks=hunks)
+    for finding in findings:
+        if not finding.file_path or not finding.line_start:
+            annotated.unlocated_findings.append(finding)
+            continue
+        located = False
+        line_end = finding.line_end or finding.line_start
+        for hunk in hunks:
+            if not _paths_match(finding.file_path, hunk.file_path):
+                continue
+            for diff_line in hunk.lines:
+                if diff_line.new_line is None:
+                    continue
+                if finding.line_start <= diff_line.new_line <= line_end:
+                    diff_line.finding_ids.append(finding.id)
+                    if finding.id not in annotated.finding_line_map:
+                        annotated.finding_line_map[finding.id] = []
+                    annotated.finding_line_map[finding.id].append(
+                        (hunk.file_path, diff_line.new_line)
+                    )
+                    located = True
+        if not located:
+            annotated.unlocated_findings.append(finding)
+    return annotated
+
+
+def _paths_match(finding_path: str, hunk_path: str) -> bool:
+    """Check if a finding path matches a hunk path (handles relative paths)."""
+    if finding_path == hunk_path:
+        return True
+    if finding_path.endswith(hunk_path) or hunk_path.endswith(finding_path):
+        return True
+    finding_parts = finding_path.replace('\\', '/').split('/')
+    hunk_parts = hunk_path.replace('\\', '/').split('/')
+    min_len = min(len(finding_parts), len(hunk_parts))
+    return finding_parts[-min_len:] == hunk_parts[-min_len:]
+
+
+def get_severity_color(severity: str) -> tuple[str, str]:
+    """Get ANSI color codes for severity level. Returns (start, end)."""
+    colors = {
+        "critical": ("\033[41;37m", "\033[0m"),  # White on red bg
+        "high": ("\033[91m", "\033[0m"),          # Bright red
+        "medium": ("\033[93m", "\033[0m"),        # Yellow
+        "low": ("\033[94m", "\033[0m"),           # Blue
+        "info": ("\033[90m", "\033[0m"),          # Gray
+    }
+    return colors.get(severity, ("", ""))
+
+
+def render_annotated_diff(
+    annotated: AnnotatedDiff,
+    findings: list[Finding],
+    use_color: bool = True,
+) -> str:
+    """Render annotated diff with findings highlighted."""
+    finding_map = {f.id: f for f in findings}
+    lines: list[str] = []
+    c_add = "\033[32m" if use_color else ""
+    c_rem = "\033[31m" if use_color else ""
+    c_hdr = "\033[36m" if use_color else ""
+    c_ann = "\033[33m" if use_color else ""
+    c_end = "\033[0m" if use_color else ""
+    for hunk in annotated.hunks:
+        lines.append(f"{c_hdr}diff --git a/{hunk.file_path} b/{hunk.file_path}{c_end}")
+        lines.append(f"{c_hdr}{hunk.header}{c_end}")
+        for diff_line in hunk.lines:
+            prefix = " "
+            color = ""
+            if diff_line.line_type == "add":
+                prefix = "+"
+                color = c_add
+            elif diff_line.line_type == "remove":
+                prefix = "-"
+                color = c_rem
+            line_content = f"{color}{prefix}{diff_line.content}{c_end}"
+            if diff_line.finding_ids:
+                annotations = []
+                for fid in diff_line.finding_ids:
+                    f = finding_map.get(fid)
+                    if f:
+                        sev_start, sev_end = get_severity_color(f.severity)
+                        if use_color:
+                            ann = f"{sev_start}[{fid}]{sev_end} {f.title}"
+                        else:
+                            ann = f"[{fid}] {f.title}"
+                        annotations.append(ann)
+                ann_str = f"  {c_ann}# {'; '.join(annotations)}{c_end}"
+                line_content += ann_str
+            lines.append(line_content)
+    if annotated.unlocated_findings:
+        lines.append("")
+        lines.append(f"{c_hdr}=== Findings not mapped to diff ==={c_end}")
+        for finding in annotated.unlocated_findings:
+            sev_start, sev_end = get_severity_color(finding.severity)
+            if use_color:
+                lines.append(
+                    f"{sev_start}[{finding.severity.upper()}]{sev_end} "
+                    f"{finding.title}"
+                )
+            else:
+                lines.append(f"[{finding.severity.upper()}] {finding.title}")
+            if finding.file_path:
+                loc = finding.file_path
+                if finding.line_start:
+                    loc += f":{finding.line_start}"
+                lines.append(f"  Location: {loc}")
+    return "\n".join(lines)
+
+
+def render_annotated_diff_markdown(
+    annotated: AnnotatedDiff,
+    findings: list[Finding],
+) -> str:
+    """Render annotated diff as markdown."""
+    finding_map = {f.id: f for f in findings}
+    lines: list[str] = []
+    for hunk in annotated.hunks:
+        lines.append(f"### {hunk.file_path}")
+        lines.append("")
+        lines.append("```diff")
+        lines.append(hunk.header)
+        for diff_line in hunk.lines:
+            prefix = " "
+            if diff_line.line_type == "add":
+                prefix = "+"
+            elif diff_line.line_type == "remove":
+                prefix = "-"
+            lines.append(f"{prefix}{diff_line.content}")
+        lines.append("```")
+        findings_in_hunk = set()
+        for diff_line in hunk.lines:
+            findings_in_hunk.update(diff_line.finding_ids)
+        if findings_in_hunk:
+            lines.append("")
+            lines.append("**Findings in this hunk:**")
+            for fid in sorted(findings_in_hunk):
+                f = finding_map.get(fid)
+                if f:
+                    lines.append(
+                        f"- **[{f.severity.upper()}]** ({f.confidence}%) "
+                        f"{f.title} (line {f.line_start})"
+                    )
+            lines.append("")
+    if annotated.unlocated_findings:
+        lines.append("### Findings not mapped to diff")
+        lines.append("")
+        for finding in annotated.unlocated_findings:
+            loc = ""
+            if finding.file_path:
+                loc = f" - {finding.file_path}"
+                if finding.line_start:
+                    loc += f":{finding.line_start}"
+            lines.append(
+                f"- **[{finding.severity.upper()}]** ({finding.confidence}%) "
+                f"{finding.title}{loc}"
+            )
+    return "\n".join(lines)
 
 
 def has_blocking_findings(result: ReviewResult, threshold: int) -> bool:
@@ -1629,8 +1917,19 @@ def main() -> int:
             else:
                 return 0
 
+        annotated_diff: AnnotatedDiff | None = None
         if structured_results:
-            write_structured_json(run_dir, structured_results)
+            all_findings: list[Finding] = []
+            for result in structured_results:
+                if result:
+                    all_findings.extend(result.findings)
+            if all_findings:
+                hunks = parse_unified_diff(diff)
+                annotated_diff = map_findings_to_diff(all_findings, hunks)
+                diff_md_path = os.path.join(run_dir, "review.diff.md")
+                diff_md = render_annotated_diff_markdown(annotated_diff, all_findings)
+                write_text(diff_md_path, diff_md)
+            write_structured_json(run_dir, structured_results, annotated_diff)
 
         log_md = os.path.join(run_dir, "review.log.md")
         if block == "2" and not gate_action:
@@ -1687,6 +1986,13 @@ def main() -> int:
             structured_json = os.path.join(run_dir, "review.structured.json")
             if os.path.isfile(structured_json):
                 sys.stderr.write(f"\nStructured output: {structured_json}\n")
+            if annotated_diff and annotated_diff.finding_line_map:
+                use_color = sys.stderr.isatty()
+                sys.stderr.write("\n=== ANNOTATED DIFF ===\n")
+                highlighted = render_annotated_diff(
+                    annotated_diff, all_findings, use_color=use_color
+                )
+                sys.stderr.write(highlighted + "\n")
             sys.stderr.write(
                 "\nACTION REQUIRED: Reply with 'review:apply' to act on this feedback, "
                 "or 'review:skip' to skip reviews for the rest of this session. "

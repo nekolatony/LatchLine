@@ -370,3 +370,165 @@ def test_write_structured_json(tmp_path):
     assert len(data["passes"]) == 1
     assert len(data["all_findings"]) == 1
     assert data["all_findings"][0]["confidence"] == 85
+
+
+# Diff highlighting tests
+
+SAMPLE_DIFF = """\
+diff --git a/src/db.py b/src/db.py
+--- a/src/db.py
++++ b/src/db.py
+@@ -40,7 +40,7 @@ class Database:
+     def execute(self, query_str, user_input):
+         cursor = self.conn.cursor()
+-        cursor.execute(f"SELECT * FROM users WHERE id = {user_input}")
++        cursor.execute(f"SELECT * FROM users WHERE name = {user_input}")
+         return cursor.fetchall()
+"""
+
+
+def test_parse_unified_diff_basic():
+    hunks = ai_review.parse_unified_diff(SAMPLE_DIFF)
+    assert len(hunks) == 1
+    hunk = hunks[0]
+    assert hunk.file_path == "src/db.py"
+    assert hunk.old_start == 40
+    assert hunk.new_start == 40
+    assert len(hunk.lines) == 5
+    # Check line types
+    line_types = [line.line_type for line in hunk.lines]
+    assert line_types == ["context", "context", "remove", "add", "context"]
+
+
+def test_parse_unified_diff_line_numbers():
+    hunks = ai_review.parse_unified_diff(SAMPLE_DIFF)
+    hunk = hunks[0]
+    # Context line at start
+    assert hunk.lines[0].old_line == 40
+    assert hunk.lines[0].new_line == 40
+    # Remove line
+    assert hunk.lines[2].old_line == 42
+    assert hunk.lines[2].new_line is None
+    # Add line
+    assert hunk.lines[3].old_line is None
+    assert hunk.lines[3].new_line == 42
+
+
+def test_map_findings_to_diff_locates_finding():
+    hunks = ai_review.parse_unified_diff(SAMPLE_DIFF)
+    finding = ai_review.Finding(
+        id="F001", severity="high", category="security",
+        confidence=90, title="SQL Injection",
+        description="User input in query",
+        file_path="src/db.py", line_start=42, line_end=42,
+    )
+    annotated = ai_review.map_findings_to_diff([finding], hunks)
+    assert "F001" in annotated.finding_line_map
+    assert len(annotated.unlocated_findings) == 0
+    # Check finding is attached to the add line
+    hunk = annotated.hunks[0]
+    add_line = [ln for ln in hunk.lines if ln.line_type == "add"][0]
+    assert "F001" in add_line.finding_ids
+
+
+def test_map_findings_to_diff_unlocated():
+    hunks = ai_review.parse_unified_diff(SAMPLE_DIFF)
+    finding = ai_review.Finding(
+        id="F001", severity="high", category="security",
+        confidence=90, title="Issue in other file",
+        description="Desc",
+        file_path="src/other.py", line_start=10,
+    )
+    annotated = ai_review.map_findings_to_diff([finding], hunks)
+    assert "F001" not in annotated.finding_line_map
+    assert len(annotated.unlocated_findings) == 1
+
+
+def test_map_findings_without_location():
+    hunks = ai_review.parse_unified_diff(SAMPLE_DIFF)
+    finding = ai_review.Finding(
+        id="F001", severity="info", category="style",
+        confidence=50, title="General observation",
+        description="Desc",
+        file_path=None, line_start=None,
+    )
+    annotated = ai_review.map_findings_to_diff([finding], hunks)
+    assert len(annotated.unlocated_findings) == 1
+
+
+def test_render_annotated_diff_includes_annotations():
+    hunks = ai_review.parse_unified_diff(SAMPLE_DIFF)
+    finding = ai_review.Finding(
+        id="F001", severity="high", category="security",
+        confidence=90, title="SQL Injection",
+        description="User input in query",
+        file_path="src/db.py", line_start=42,
+    )
+    annotated = ai_review.map_findings_to_diff([finding], hunks)
+    output = ai_review.render_annotated_diff(annotated, [finding], use_color=False)
+    assert "[F001]" in output
+    assert "SQL Injection" in output
+    assert "src/db.py" in output
+
+
+def test_render_annotated_diff_markdown():
+    hunks = ai_review.parse_unified_diff(SAMPLE_DIFF)
+    finding = ai_review.Finding(
+        id="F001", severity="high", category="security",
+        confidence=90, title="SQL Injection",
+        description="User input in query",
+        file_path="src/db.py", line_start=42,
+    )
+    annotated = ai_review.map_findings_to_diff([finding], hunks)
+    output = ai_review.render_annotated_diff_markdown(annotated, [finding])
+    assert "### src/db.py" in output
+    assert "```diff" in output
+    assert "**Findings in this hunk:**" in output
+    assert "[HIGH]" in output
+
+
+def test_paths_match():
+    assert ai_review._paths_match("src/db.py", "src/db.py")
+    assert ai_review._paths_match("/full/path/src/db.py", "src/db.py")
+    assert ai_review._paths_match("src/db.py", "full/path/src/db.py")
+    assert not ai_review._paths_match("src/db.py", "src/other.py")
+
+
+def test_parse_unified_diff_strips_latchline_labels():
+    """Test that LatchLine's (before)/(after) labels are stripped from paths."""
+    diff = """\
+--- /home/user/project/src/db.py (before)
++++ /home/user/project/src/db.py (after)
+@@ -1,3 +1,4 @@
++import httpx
+ import os
+ import sys
+"""
+    hunks = ai_review.parse_unified_diff(diff)
+    assert len(hunks) == 1
+    # Path should NOT include " (after)"
+    assert hunks[0].file_path == "/home/user/project/src/db.py"
+    assert "(after)" not in hunks[0].file_path
+
+
+def test_map_findings_to_diff_with_absolute_paths():
+    """Test mapping when diff has absolute paths and findings have relative paths."""
+    diff = """\
+--- /home/user/project/src/db.py (before)
++++ /home/user/project/src/db.py (after)
+@@ -1,3 +1,4 @@
++import httpx
+ import os
+ import sys
+"""
+    hunks = ai_review.parse_unified_diff(diff)
+    finding = ai_review.Finding(
+        id="F001", severity="high", category="correctness",
+        confidence=90, title="Test",
+        description="Desc",
+        file_path="src/db.py", line_start=1,
+    )
+    annotated = ai_review.map_findings_to_diff([finding], hunks)
+    # Finding should be located because src/db.py matches end of absolute path
+    assert "F001" in annotated.finding_line_map
+    assert len(annotated.unlocated_findings) == 0
