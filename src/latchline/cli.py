@@ -70,6 +70,68 @@ class AnnotatedDiff:
     unlocated_findings: list[Finding] = field(default_factory=list)
 
 
+@dataclass
+class Symbol:
+    """A code symbol (function, class, constant)."""
+    name: str
+    kind: str  # function|class|method|constant
+    file_path: str
+    line_start: int
+    line_end: int | None = None
+    signature: str | None = None
+    parent: str | None = None
+
+
+@dataclass
+class SymbolChange:
+    """A change to a symbol detected from diff."""
+    symbol: Symbol
+    change_type: str  # modified|added|removed|signature_changed
+    old_signature: str | None = None
+    new_signature: str | None = None
+    breaking: bool = False
+    breaking_reason: str | None = None
+
+
+@dataclass
+class ImportEdge:
+    """An import relationship: importer imports from importee."""
+    importer: str
+    importee: str
+    symbols: list[str]
+    line: int
+
+
+@dataclass
+class Dependent:
+    """A file that depends on a changed file."""
+    file_path: str
+    line: int
+    symbol_used: str
+    import_type: str  # direct|transitive
+    confidence: int
+
+
+@dataclass
+class DependencyGraph:
+    """Cached reverse dependency graph."""
+    project_root: str
+    cache_version: str = "1.0"
+    created_at: str = ""
+    file_hashes: dict[str, str] = field(default_factory=dict)
+    forward_edges: dict[str, list[ImportEdge]] = field(default_factory=dict)
+    reverse_edges: dict[str, list[ImportEdge]] = field(default_factory=dict)
+
+
+@dataclass
+class ImpactReport:
+    """Summary of cross-file impact."""
+    changed_symbols: list[SymbolChange] = field(default_factory=list)
+    dependents: list[Dependent] = field(default_factory=list)
+    breaking_changes: list[SymbolChange] = field(default_factory=list)
+    transitive_depth: int = 0
+
+
 def read_json_stdin() -> dict[str, Any]:
     raw = sys.stdin.read()
     if not raw.strip():
@@ -505,6 +567,682 @@ def expand_dependencies(
     return sorted(resolved)
 
 
+# --- Impact Analysis Functions ---
+
+def get_cache_path(project_root: str, log_dir: str) -> str:
+    """Get path to dependency graph cache: $log_dir/cache/depgraph-<hash>.json"""
+    import hashlib
+    project_hash = hashlib.md5(project_root.encode()).hexdigest()[:12]
+    cache_dir = os.path.join(log_dir, "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, f"depgraph-{project_hash}.json")
+
+
+def file_hash(path: str) -> str:
+    """Quick hash (mtime:size) for cache invalidation."""
+    try:
+        stat = os.stat(path)
+        return f"{stat.st_mtime}:{stat.st_size}"
+    except OSError:
+        return ""
+
+
+def load_dependency_graph(cache_path: str) -> DependencyGraph | None:
+    """Load cached dependency graph from disk."""
+    if not os.path.isfile(cache_path):
+        return None
+    try:
+        with open(cache_path, encoding="utf-8") as f:
+            data = json.load(f)
+        graph = DependencyGraph(project_root=data.get("project_root", ""))
+        graph.cache_version = data.get("cache_version", "1.0")
+        graph.created_at = data.get("created_at", "")
+        graph.file_hashes = data.get("file_hashes", {})
+        for path, edges_data in data.get("forward_edges", {}).items():
+            graph.forward_edges[path] = [
+                ImportEdge(
+                    importer=e["importer"],
+                    importee=e["importee"],
+                    symbols=e["symbols"],
+                    line=e["line"],
+                )
+                for e in edges_data
+            ]
+        for path, edges_data in data.get("reverse_edges", {}).items():
+            graph.reverse_edges[path] = [
+                ImportEdge(
+                    importer=e["importer"],
+                    importee=e["importee"],
+                    symbols=e["symbols"],
+                    line=e["line"],
+                )
+                for e in edges_data
+            ]
+        return graph
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
+
+
+def save_dependency_graph(graph: DependencyGraph, cache_path: str) -> None:
+    """Save dependency graph to disk."""
+    data = {
+        "project_root": graph.project_root,
+        "cache_version": graph.cache_version,
+        "created_at": graph.created_at,
+        "file_hashes": graph.file_hashes,
+        "forward_edges": {
+            path: [asdict(e) for e in edges]
+            for path, edges in graph.forward_edges.items()
+        },
+        "reverse_edges": {
+            path: [asdict(e) for e in edges]
+            for path, edges in graph.reverse_edges.items()
+        },
+    }
+    ensure_parent(cache_path)
+    write_text(cache_path, json.dumps(data, indent=2) + "\n")
+
+
+def extract_python_import_edges(path: str, text: str, project_root: str) -> list[ImportEdge]:
+    """Extract import edges from a Python file using AST."""
+    edges: list[ImportEdge] = []
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return edges
+    file_dir = os.path.dirname(path)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                resolved = resolve_python_module(alias.name, 0, file_dir, project_root)
+                for target in resolved:
+                    edges.append(ImportEdge(
+                        importer=path,
+                        importee=target,
+                        symbols=[alias.name.split(".")[-1]],
+                        line=node.lineno,
+                    ))
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            level = node.level or 0
+            resolved = resolve_python_module(module, level, file_dir, project_root)
+            symbols = [alias.name for alias in node.names]
+            for target in resolved:
+                edges.append(ImportEdge(
+                    importer=path,
+                    importee=target,
+                    symbols=symbols,
+                    line=node.lineno,
+                ))
+            for alias in node.names:
+                name = f"{module}.{alias.name}" if module else alias.name
+                subresolved = resolve_python_module(name, level, file_dir, project_root)
+                for target in subresolved:
+                    if target not in resolved:
+                        edges.append(ImportEdge(
+                            importer=path,
+                            importee=target,
+                            symbols=[alias.name],
+                            line=node.lineno,
+                        ))
+    return edges
+
+
+def extract_js_import_edges(path: str, text: str, project_root: str) -> list[ImportEdge]:
+    """Extract import edges from a JS/TS file using regex."""
+    edges: list[ImportEdge] = []
+    file_dir = os.path.dirname(path)
+    exts = [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".json"]
+    import_pattern = re.compile(
+        r"(?:import\s+(?:(\{[^}]+\})|(\*\s+as\s+\w+)|(\w+))"
+        r"(?:\s*,\s*(?:(\{[^}]+\})|(\*\s+as\s+\w+)))?"
+        r"\s+from\s+)?['\"]([^'\"]+)['\"]",
+        re.MULTILINE,
+    )
+    for line_num, line in enumerate(text.splitlines(), 1):
+        for match in import_pattern.finditer(line):
+            named_imports = match.group(1) or match.group(4)
+            star_import = match.group(2) or match.group(5)
+            default_import = match.group(3)
+            module_path = match.group(6)
+            if not module_path.startswith((".", "/")):
+                continue
+            symbols: list[str] = []
+            if named_imports:
+                symbols = [s.strip().split(" as ")[0].strip()
+                          for s in named_imports.strip("{}").split(",") if s.strip()]
+            if star_import:
+                symbols.append("*")
+            if default_import:
+                symbols.append("default")
+            if not symbols:
+                symbols = ["*"]
+            base = (
+                os.path.join(project_root, module_path.lstrip("/"))
+                if module_path.startswith("/")
+                else os.path.join(file_dir, module_path)
+            )
+            candidates: list[str] = []
+            if os.path.splitext(base)[1]:
+                candidates.append(base)
+            else:
+                for ext in exts:
+                    candidates.append(base + ext)
+                for ext in exts:
+                    candidates.append(os.path.join(base, f"index{ext}"))
+            for candidate in candidates:
+                if os.path.isfile(candidate) and is_within_root(candidate, project_root):
+                    edges.append(ImportEdge(
+                        importer=path,
+                        importee=os.path.abspath(candidate),
+                        symbols=symbols,
+                        line=line_num,
+                    ))
+                    break
+    return edges
+
+
+def extract_import_edges(path: str, project_root: str, ext: str) -> list[ImportEdge]:
+    """Extract import edges from a file based on extension."""
+    text = read_text(path)
+    if not text:
+        return []
+    if ext == ".py":
+        return extract_python_import_edges(path, text, project_root)
+    if ext in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+        return extract_js_import_edges(path, text, project_root)
+    return []
+
+
+def build_reverse_graph(project_root: str, log_dir: str) -> DependencyGraph:
+    """Build/update reverse dependency graph with incremental caching."""
+    cache_path = get_cache_path(project_root, log_dir)
+    graph = load_dependency_graph(cache_path)
+    if graph is None or graph.project_root != project_root:
+        graph = DependencyGraph(project_root=project_root)
+    skip_dirs = {"node_modules", ".git", "__pycache__", ".venv", "venv", ".tox", ".mypy_cache"}
+    scan_exts = {".py", ".js", ".ts", ".tsx", ".jsx", ".mjs", ".cjs"}
+    files_to_scan: list[str] = []
+    current_hashes: dict[str, str] = {}
+    for root, dirs, files in os.walk(project_root):
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
+        for name in files:
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in scan_exts:
+                continue
+            path = os.path.abspath(os.path.join(root, name))
+            h = file_hash(path)
+            current_hashes[path] = h
+            if graph.file_hashes.get(path) != h:
+                files_to_scan.append(path)
+    removed = set(graph.file_hashes.keys()) - set(current_hashes.keys())
+    for path in removed:
+        graph.forward_edges.pop(path, None)
+        for importee, edges in list(graph.reverse_edges.items()):
+            graph.reverse_edges[importee] = [e for e in edges if e.importer != path]
+    for path in files_to_scan:
+        ext = os.path.splitext(path)[1].lower()
+        old_edges = graph.forward_edges.get(path, [])
+        for edge in old_edges:
+            if edge.importee in graph.reverse_edges:
+                graph.reverse_edges[edge.importee] = [
+                    e for e in graph.reverse_edges[edge.importee]
+                    if e.importer != path
+                ]
+        new_edges = extract_import_edges(path, project_root, ext)
+        graph.forward_edges[path] = new_edges
+        for edge in new_edges:
+            if edge.importee not in graph.reverse_edges:
+                graph.reverse_edges[edge.importee] = []
+            graph.reverse_edges[edge.importee].append(edge)
+    graph.file_hashes = current_hashes
+    graph.created_at = utc_now()
+    save_dependency_graph(graph, cache_path)
+    return graph
+
+
+def extract_python_symbols(path: str, text: str) -> list[Symbol]:
+    """AST-based extraction of functions, classes with signatures."""
+    symbols: list[Symbol] = []
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return symbols
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) or isinstance(node, ast.AsyncFunctionDef):
+            args = []
+            for arg in node.args.args:
+                arg_name = arg.arg
+                if arg.annotation:
+                    try:
+                        arg_name += f": {ast.unparse(arg.annotation)}"
+                    except (AttributeError, ValueError):
+                        pass
+                args.append(arg_name)
+            for arg in node.args.kwonlyargs:
+                arg_name = arg.arg
+                if arg.annotation:
+                    try:
+                        arg_name += f": {ast.unparse(arg.annotation)}"
+                    except (AttributeError, ValueError):
+                        pass
+                args.append(arg_name)
+            if node.args.vararg:
+                args.append(f"*{node.args.vararg.arg}")
+            if node.args.kwarg:
+                args.append(f"**{node.args.kwarg.arg}")
+            sig = f"def {node.name}({', '.join(args)})"
+            end_line = node.end_lineno if hasattr(node, "end_lineno") else None
+            parent = None
+            for parent_node in ast.walk(tree):
+                if isinstance(parent_node, ast.ClassDef):
+                    for child in ast.iter_child_nodes(parent_node):
+                        if child is node:
+                            parent = parent_node.name
+                            break
+            symbols.append(Symbol(
+                name=node.name,
+                kind="method" if parent else "function",
+                file_path=path,
+                line_start=node.lineno,
+                line_end=end_line,
+                signature=sig,
+                parent=parent,
+            ))
+        elif isinstance(node, ast.ClassDef):
+            bases = []
+            for base in node.bases:
+                try:
+                    bases.append(ast.unparse(base))
+                except (AttributeError, ValueError):
+                    pass
+            sig = f"class {node.name}" + (f"({', '.join(bases)})" if bases else "")
+            end_line = node.end_lineno if hasattr(node, "end_lineno") else None
+            symbols.append(Symbol(
+                name=node.name,
+                kind="class",
+                file_path=path,
+                line_start=node.lineno,
+                line_end=end_line,
+                signature=sig,
+            ))
+        elif isinstance(node, ast.Assign):
+            if node.col_offset == 0:
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id.isupper():
+                        symbols.append(Symbol(
+                            name=target.id,
+                            kind="constant",
+                            file_path=path,
+                            line_start=node.lineno,
+                        ))
+    return symbols
+
+
+def extract_js_symbols(path: str, text: str) -> list[Symbol]:
+    """Regex-based extraction for JS/TS."""
+    symbols: list[Symbol] = []
+    func_re = re.compile(
+        r"^(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*(\([^)]*\))",
+        re.MULTILINE,
+    )
+    arrow_re = re.compile(
+        r"^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?(\([^)]*\)|\w+)\s*=>",
+        re.MULTILINE,
+    )
+    class_re = re.compile(
+        r"^(?:export\s+)?class\s+(\w+)(?:\s+extends\s+(\w+))?",
+        re.MULTILINE,
+    )
+    const_re = re.compile(
+        r"^(?:export\s+)?const\s+([A-Z][A-Z0-9_]*)\s*=",
+        re.MULTILINE,
+    )
+    lines = text.splitlines()
+    for i, line in enumerate(lines, 1):
+        for match in func_re.finditer(line):
+            symbols.append(Symbol(
+                name=match.group(1),
+                kind="function",
+                file_path=path,
+                line_start=i,
+                signature=f"function {match.group(1)}{match.group(2)}",
+            ))
+        for match in arrow_re.finditer(line):
+            params = match.group(2)
+            if not params.startswith("("):
+                params = f"({params})"
+            symbols.append(Symbol(
+                name=match.group(1),
+                kind="function",
+                file_path=path,
+                line_start=i,
+                signature=f"const {match.group(1)} = {params} =>",
+            ))
+        for match in class_re.finditer(line):
+            base = match.group(2)
+            sig = f"class {match.group(1)}" + (f" extends {base}" if base else "")
+            symbols.append(Symbol(
+                name=match.group(1),
+                kind="class",
+                file_path=path,
+                line_start=i,
+                signature=sig,
+            ))
+        for match in const_re.finditer(line):
+            symbols.append(Symbol(
+                name=match.group(1),
+                kind="constant",
+                file_path=path,
+                line_start=i,
+            ))
+    return symbols
+
+
+def extract_symbols_from_file(path: str) -> list[Symbol]:
+    """Extract symbols from a file based on extension."""
+    text = read_text(path)
+    if not text:
+        return []
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".py":
+        return extract_python_symbols(path, text)
+    if ext in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+        return extract_js_symbols(path, text)
+    return []
+
+
+def extract_changed_symbols_from_diff(diff_text: str, project_root: str) -> list[SymbolChange]:
+    """Parse diff to find which symbols were modified."""
+    changes: list[SymbolChange] = []
+    hunks = parse_unified_diff(diff_text)
+    for hunk in hunks:
+        file_path = hunk.file_path
+        if not file_path.startswith("/"):
+            file_path = os.path.join(project_root, file_path)
+        file_path = os.path.abspath(file_path)
+        if not os.path.isfile(file_path):
+            continue
+        symbols = extract_symbols_from_file(file_path)
+        modified_lines = set()
+        added_lines = set()
+        for line in hunk.lines:
+            if line.line_type == "add" and line.new_line:
+                added_lines.add(line.new_line)
+                modified_lines.add(line.new_line)
+            elif line.line_type == "remove" and line.old_line:
+                modified_lines.add(line.old_line)
+        for symbol in symbols:
+            start = symbol.line_start
+            end = symbol.line_end or start
+            if any(start <= ln <= end for ln in modified_lines):
+                change_type = "modified"
+                if any(start <= ln <= end for ln in added_lines):
+                    change_type = "added" if start in added_lines else "modified"
+                changes.append(SymbolChange(
+                    symbol=symbol,
+                    change_type=change_type,
+                ))
+    seen = set()
+    unique_changes: list[SymbolChange] = []
+    for change in changes:
+        key = (change.symbol.file_path, change.symbol.name, change.symbol.kind)
+        if key not in seen:
+            seen.add(key)
+            unique_changes.append(change)
+    return unique_changes
+
+
+def compare_signatures(old_sig: str, new_sig: str) -> tuple[bool, str | None]:
+    """Returns (is_breaking, reason)."""
+    if old_sig == new_sig:
+        return False, None
+    old_match = re.search(r"\(([^)]*)\)", old_sig)
+    new_match = re.search(r"\(([^)]*)\)", new_sig)
+    if not old_match or not new_match:
+        return False, None
+    old_args = [a.strip() for a in old_match.group(1).split(",") if a.strip()]
+    new_args = [a.strip() for a in new_match.group(1).split(",") if a.strip()]
+    old_required = [a for a in old_args if "=" not in a and not a.startswith("*")]
+    new_required = [a for a in new_args if "=" not in a and not a.startswith("*")]
+    if len(new_required) > len(old_required):
+        return True, "Added required arguments"
+    old_names = {a.split(":")[0].split("=")[0].strip() for a in old_args}
+    new_names = {a.split(":")[0].split("=")[0].strip() for a in new_args}
+    removed = old_names - new_names
+    if removed:
+        return True, f"Removed arguments: {', '.join(sorted(removed))}"
+    return False, None
+
+
+def detect_breaking_changes(
+    before_path: str, after_path: str, project_root: str
+) -> list[SymbolChange]:
+    """Compare before/after to detect breaking changes."""
+    changes: list[SymbolChange] = []
+    before_text = read_text(before_path)
+    after_text = read_text(after_path) if os.path.isfile(after_path) else ""
+    ext = os.path.splitext(before_path)[1].lower()
+    if ext == ".py":
+        before_symbols = extract_python_symbols(before_path, before_text)
+        after_symbols = extract_python_symbols(after_path, after_text) if after_text else []
+    elif ext in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+        before_symbols = extract_js_symbols(before_path, before_text)
+        after_symbols = extract_js_symbols(after_path, after_text) if after_text else []
+    else:
+        return changes
+    after_by_name: dict[str, Symbol] = {s.name: s for s in after_symbols}
+    for before_sym in before_symbols:
+        if before_sym.kind not in {"function", "method", "class"}:
+            continue
+        after_sym = after_by_name.get(before_sym.name)
+        if after_sym is None:
+            changes.append(SymbolChange(
+                symbol=before_sym,
+                change_type="removed",
+                old_signature=before_sym.signature,
+                breaking=True,
+                breaking_reason="Symbol removed",
+            ))
+        elif before_sym.signature and after_sym.signature:
+            is_breaking, reason = compare_signatures(
+                before_sym.signature, after_sym.signature
+            )
+            if is_breaking:
+                changes.append(SymbolChange(
+                    symbol=after_sym,
+                    change_type="signature_changed",
+                    old_signature=before_sym.signature,
+                    new_signature=after_sym.signature,
+                    breaking=True,
+                    breaking_reason=reason,
+                ))
+    return changes
+
+
+def find_dependents(
+    graph: DependencyGraph,
+    changed_files: list[str],
+    max_dependents: int,
+    depth: int,
+) -> list[Dependent]:
+    """Find files that depend on the changed files."""
+    dependents: list[Dependent] = []
+    seen: set[str] = set()
+    frontier = [(path, "direct", 0) for path in changed_files]
+    while frontier and len(dependents) < max_dependents:
+        path, import_type, current_depth = frontier.pop(0)
+        path = os.path.abspath(path)
+        edges = graph.reverse_edges.get(path, [])
+        for edge in edges:
+            if edge.importer in seen:
+                continue
+            seen.add(edge.importer)
+            for symbol in edge.symbols:
+                dependents.append(Dependent(
+                    file_path=edge.importer,
+                    line=edge.line,
+                    symbol_used=symbol,
+                    import_type=import_type,
+                    confidence=90 if import_type == "direct" else 70,
+                ))
+            if current_depth < depth:
+                frontier.append((edge.importer, "transitive", current_depth + 1))
+            if len(dependents) >= max_dependents:
+                break
+    return dependents
+
+
+def analyze_cross_file_impact(
+    *,
+    run_dir: str,
+    project_root: str,
+    log_dir: str,
+    changed_files: list[str],
+    diff_text: str,
+    config: dict[str, str],
+) -> ImpactReport:
+    """Main entry point for impact analysis."""
+    enabled = parse_bool(
+        config.get("REVIEWER_IMPACT_ANALYSIS") or os.environ.get("REVIEWER_IMPACT_ANALYSIS"),
+        False,
+    )
+    if not enabled:
+        return ImpactReport()
+    max_dependents = parse_int(
+        config.get("REVIEWER_IMPACT_MAX_DEPENDENTS")
+        or os.environ.get("REVIEWER_IMPACT_MAX_DEPENDENTS"),
+        20,
+    )
+    depth = parse_int(
+        config.get("REVIEWER_IMPACT_DEPTH") or os.environ.get("REVIEWER_IMPACT_DEPTH"),
+        1,
+    )
+    report = ImpactReport(transitive_depth=depth)
+    graph = build_reverse_graph(project_root, log_dir)
+    changed_symbols = extract_changed_symbols_from_diff(diff_text, project_root)
+    report.changed_symbols = changed_symbols
+    abs_changed = [os.path.abspath(f) for f in changed_files if f]
+    report.dependents = find_dependents(graph, abs_changed, max_dependents, depth)
+    before_dir = os.path.join(run_dir, "before")
+    for path in abs_changed:
+        before_path = os.path.join(before_dir, path.lstrip("/"))
+        if os.path.isfile(before_path):
+            breaking = detect_breaking_changes(before_path, path, project_root)
+            report.breaking_changes.extend(breaking)
+    return report
+
+
+def create_impact_findings(report: ImpactReport) -> list[Finding]:
+    """Convert ImpactReport to Finding objects."""
+    findings: list[Finding] = []
+    for i, change in enumerate(report.breaking_changes):
+        findings.append(Finding(
+            id=f"IMP{i+1:03d}",
+            severity="high",
+            category="impact",
+            confidence=85,
+            title=f"Breaking change: {change.symbol.name}",
+            description=(
+                f"{change.breaking_reason}. "
+                f"Old: {change.old_signature or 'N/A'}. "
+                f"New: {change.new_signature or 'removed'}."
+            ),
+            file_path=change.symbol.file_path,
+            line_start=change.symbol.line_start,
+            line_end=change.symbol.line_end,
+        ))
+    if report.dependents and len(report.dependents) >= 5:
+        dep_files = list({d.file_path for d in report.dependents})[:5]
+        findings.append(Finding(
+            id=f"IMP{len(report.breaking_changes)+1:03d}",
+            severity="medium",
+            category="impact",
+            confidence=75,
+            title=f"{len(report.dependents)} files depend on changed code",
+            description=(
+                f"Changed files are imported by: {', '.join(dep_files)}"
+                + (f" and {len(dep_files) - 5} more" if len(dep_files) > 5 else "")
+            ),
+        ))
+    return findings
+
+
+def write_impact_report(run_dir: str, report: ImpactReport) -> None:
+    """Write impact.json and impact.md to run directory."""
+    def symbol_to_dict(s: Symbol) -> dict[str, Any]:
+        return {
+            "name": s.name,
+            "kind": s.kind,
+            "file_path": s.file_path,
+            "line_start": s.line_start,
+            "line_end": s.line_end,
+            "signature": s.signature,
+            "parent": s.parent,
+        }
+    json_data = {
+        "version": "1.0",
+        "generated_at": utc_now(),
+        "changed_symbols": [
+            {
+                "symbol": symbol_to_dict(c.symbol),
+                "change_type": c.change_type,
+                "old_signature": c.old_signature,
+                "new_signature": c.new_signature,
+                "breaking": c.breaking,
+                "breaking_reason": c.breaking_reason,
+            }
+            for c in report.changed_symbols
+        ],
+        "dependents": [asdict(d) for d in report.dependents],
+        "breaking_changes": [
+            {
+                "symbol": symbol_to_dict(c.symbol),
+                "change_type": c.change_type,
+                "old_signature": c.old_signature,
+                "new_signature": c.new_signature,
+                "breaking": c.breaking,
+                "breaking_reason": c.breaking_reason,
+            }
+            for c in report.breaking_changes
+        ],
+        "transitive_depth": report.transitive_depth,
+    }
+    json_path = os.path.join(run_dir, "impact.json")
+    write_text(json_path, json.dumps(json_data, indent=2) + "\n")
+    md_lines = ["# Impact Analysis Report", "", f"Generated: {utc_now()}", ""]
+    if report.breaking_changes:
+        md_lines.append("## Breaking Changes")
+        md_lines.append("")
+        for change in report.breaking_changes:
+            md_lines.append(f"- **{change.symbol.name}** ({change.symbol.kind})")
+            md_lines.append(f"  - Reason: {change.breaking_reason}")
+            if change.old_signature:
+                md_lines.append(f"  - Old: `{change.old_signature}`")
+            if change.new_signature:
+                md_lines.append(f"  - New: `{change.new_signature}`")
+            md_lines.append(f"  - Location: {change.symbol.file_path}:{change.symbol.line_start}")
+        md_lines.append("")
+    if report.changed_symbols:
+        md_lines.append("## Changed Symbols")
+        md_lines.append("")
+        for change in report.changed_symbols:
+            md_lines.append(
+                f"- {change.symbol.name} ({change.symbol.kind}) - {change.change_type}"
+            )
+        md_lines.append("")
+    if report.dependents:
+        md_lines.append("## Dependent Files")
+        md_lines.append("")
+        for dep in report.dependents:
+            md_lines.append(
+                f"- {dep.file_path}:{dep.line} uses `{dep.symbol_used}` ({dep.import_type})"
+            )
+        md_lines.append("")
+    md_path = os.path.join(run_dir, "impact.md")
+    write_text(md_path, "\n".join(md_lines))
+
+
 def build_context_bundle(
     *,
     run_dir: str,
@@ -512,6 +1250,7 @@ def build_context_bundle(
     cwd_path: str,
     changed_files: list[str],
     config: dict[str, str],
+    impact_report: ImpactReport | None = None,
 ) -> tuple[str, str]:
     enabled = parse_bool(
         config.get("REVIEWER_CONTEXT") or os.environ.get("REVIEWER_CONTEXT"),
@@ -528,6 +1267,11 @@ def build_context_bundle(
         config.get("REVIEWER_CONTEXT_DEPTH")
         or os.environ.get("REVIEWER_CONTEXT_DEPTH"),
         2,
+    )
+    include_dependents = parse_bool(
+        config.get("REVIEWER_INCLUDE_DEPENDENTS")
+        or os.environ.get("REVIEWER_INCLUDE_DEPENDENTS"),
+        False,
     )
     if max_bytes <= 0:
         return "", ""
@@ -550,6 +1294,9 @@ def build_context_bundle(
     infra_files = list_infra_files(root)
     test_files = list_test_files(root, abs_changed)
     deps = expand_dependencies(abs_changed, root, depth)
+    dependent_files: list[str] = []
+    if include_dependents and impact_report:
+        dependent_files = [d.file_path for d in impact_report.dependents if os.path.isfile(d.file_path)]
 
     ordered: list[str] = []
     seen: set[str] = set()
@@ -566,6 +1313,7 @@ def build_context_bundle(
     add_paths(test_files)
     add_paths(infra_files)
     add_paths([path for path in deps if path not in seen])
+    add_paths(dependent_files)
 
     entries: list[tuple[str, str]] = [
         (path, display_path(path, root)) for path in ordered
@@ -732,7 +1480,7 @@ def parse_structured_output(raw_output: str, pass_number: int, backend: str) -> 
         raw_category = str(f.get("category", "correctness")).lower()
         valid_categories = {
             "correctness", "security", "regression",
-            "missing_test", "style", "performance"
+            "missing_test", "style", "performance", "impact"
         }
         category = raw_category if raw_category in valid_categories else "correctness"
         finding = Finding(
@@ -1846,12 +2594,21 @@ def main() -> int:
         codex_out = os.path.join(run_dir, "review.codex.md")
         claude_out = os.path.join(run_dir, "review.claude.md")
         changed_files = [line for line in read_lines(files_file) if line]
+        impact_report = analyze_cross_file_impact(
+            run_dir=run_dir,
+            project_root=project_root,
+            log_dir=base_dir,
+            changed_files=changed_files,
+            diff_text=diff,
+            config=config,
+        )
         context_file, context_files_file = build_context_bundle(
             run_dir=run_dir,
             project_root=project_root,
             cwd_path=cwd_path,
             changed_files=changed_files,
             config=config,
+            impact_report=impact_report,
         )
 
         structured_results: list[ReviewResult] = []
@@ -1916,6 +2673,12 @@ def main() -> int:
                     structured_results.append(result)
             else:
                 return 0
+
+        if impact_report.breaking_changes or impact_report.dependents:
+            impact_findings = create_impact_findings(impact_report)
+            if structured_results and structured_results[0]:
+                structured_results[0].findings.extend(impact_findings)
+            write_impact_report(run_dir, impact_report)
 
         annotated_diff: AnnotatedDiff | None = None
         if structured_results:

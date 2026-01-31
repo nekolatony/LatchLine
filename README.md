@@ -71,6 +71,10 @@ See `config/reviewer.conf` for defaults and supported values.
 | `REVIEWER_CONTEXT_DEPTH` | `2` | Any integer | Dependency expansion depth for local imports. |
 | `REVIEWER_CONFIDENCE_THRESHOLD` | `70` | `0-100` | Minimum confidence score to block on a finding. Findings below threshold are logged but won't block. |
 | `REVIEWER_MULTI_PASS` | `1` | `0`, `1` | Enable two-pass review: smoke check (fast, obvious issues) then semantic pass (deep analysis). |
+| `REVIEWER_IMPACT_ANALYSIS` | `0` | `0`, `1` | Enable cross-file impact analysis: builds reverse dependency graph, detects breaking changes. |
+| `REVIEWER_IMPACT_MAX_DEPENDENTS` | `20` | Any integer | Maximum number of dependent files to report. |
+| `REVIEWER_IMPACT_DEPTH` | `1` | `0+` | Transitive dependency depth (`0` = direct only, `1+` = include transitive). |
+| `REVIEWER_INCLUDE_DEPENDENTS` | `0` | `0`, `1` | Add dependent files to context bundle for reviewer. |
 | `LATCHLINE_LOG_DIR` | `/tmp` | Any path | Base directory for logs/state/runs (created if missing, falls back to `/tmp` on failure). |
 
 ## Output Files
@@ -84,6 +88,8 @@ Each review run creates files in `$LATCHLINE_LOG_DIR/runs/{session_id}/prompt-{i
 | `review.diff.md` | Annotated diff with findings mapped to specific lines |
 | `review.log.md` | Human-readable review log |
 | `context.txt` | Context bundle sent to reviewer |
+| `impact.json` | Cross-file impact report (when enabled) |
+| `impact.md` | Human-readable impact summary (when enabled) |
 
 ## Features
 
@@ -102,6 +108,26 @@ If the smoke pass finds high-confidence critical issues, the semantic pass is sk
 
 ### Confidence Scoring
 Each finding has a confidence score (0-100). Only findings with `confidence >= REVIEWER_CONFIDENCE_THRESHOLD` will block. This reduces false positive friction.
+
+### Cross-File Impact Analysis
+When `REVIEWER_IMPACT_ANALYSIS=1`, LatchLine analyzes how changes affect other files:
+
+- **Reverse dependency graph**: Builds a cached graph of which files import what, so it can quickly find files that depend on your changes.
+- **Breaking change detection**: Compares before/after snapshots to detect:
+  - Removed functions or classes
+  - Reduced function arguments (breaks callers)
+  - Added required arguments
+- **Dependent file tracking**: Reports which files import the changed code and may need updates.
+
+Impact findings are added to the review with category `impact` and include:
+- High-severity alerts for breaking changes
+- Medium-severity warnings when many files depend on changed code
+
+Output files:
+- `impact.json`: Structured report with changed symbols, dependents, and breaking changes
+- `impact.md`: Human-readable summary
+
+The dependency graph is cached in `$LATCHLINE_LOG_DIR/cache/` and incrementally updated based on file modification times.
 
 ## Development
 Run tests with `uv run --group dev pytest` or `just test`.

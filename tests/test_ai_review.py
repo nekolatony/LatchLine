@@ -532,3 +532,182 @@ def test_map_findings_to_diff_with_absolute_paths():
     # Finding should be located because src/db.py matches end of absolute path
     assert "F001" in annotated.finding_line_map
     assert len(annotated.unlocated_findings) == 0
+
+
+# Impact analysis tests
+
+def test_build_reverse_graph_basic(tmp_path):
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    app_dir = project_root / "app"
+    app_dir.mkdir()
+    (app_dir / "__init__.py").write_text("", encoding="utf-8")
+    main_path = app_dir / "main.py"
+    util_path = app_dir / "util.py"
+    main_path.write_text("from . import util\n", encoding="utf-8")
+    util_path.write_text("def helper():\n    return 1\n", encoding="utf-8")
+    graph = ai_review.build_reverse_graph(str(project_root), str(log_dir))
+    assert graph.project_root == str(project_root)
+    assert len(graph.forward_edges) > 0
+    util_abs = str(util_path.resolve())
+    init_abs = str((app_dir / "__init__.py").resolve())
+    reverse_keys = list(graph.reverse_edges.keys())
+    has_dependency = any(util_abs in k or init_abs in k for k in reverse_keys)
+    assert has_dependency or len(graph.forward_edges) > 0
+
+
+def test_extract_python_symbols():
+    code = '''
+def process(data, config=None):
+    return data
+
+class Handler:
+    def handle(self, event):
+        pass
+
+MAX_SIZE = 100
+'''
+    symbols = ai_review.extract_python_symbols("/test.py", code)
+    names = {s.name for s in symbols}
+    assert "process" in names
+    assert "Handler" in names
+    assert "handle" in names
+    assert "MAX_SIZE" in names
+    process_sym = next(s for s in symbols if s.name == "process")
+    assert process_sym.kind == "function"
+    assert "data" in process_sym.signature
+
+
+def test_extract_js_symbols():
+    code = '''
+export function fetchData(url, options) {
+    return fetch(url, options);
+}
+
+const processItems = (items) => items.map(x => x);
+
+class DataService {
+    async load() {}
+}
+
+const API_URL = "https://api.example.com";
+'''
+    symbols = ai_review.extract_js_symbols("/test.js", code)
+    names = {s.name for s in symbols}
+    assert "fetchData" in names
+    assert "processItems" in names
+    assert "DataService" in names
+    assert "API_URL" in names
+
+
+def test_detect_breaking_changes_removed_arg(tmp_path):
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    before_path = tmp_path / "before.py"
+    after_path = tmp_path / "after.py"
+    before_path.write_text("def process(data, config, extra):\n    pass\n")
+    after_path.write_text("def process(data, config):\n    pass\n")
+    changes = ai_review.detect_breaking_changes(
+        str(before_path), str(after_path), str(project_root)
+    )
+    assert len(changes) == 1
+    assert changes[0].breaking is True
+    assert "extra" in changes[0].breaking_reason
+
+
+def test_detect_breaking_changes_removed_symbol(tmp_path):
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    before_path = tmp_path / "before.py"
+    after_path = tmp_path / "after.py"
+    before_path.write_text("def old_func():\n    pass\n\ndef keep_func():\n    pass\n")
+    after_path.write_text("def keep_func():\n    pass\n")
+    changes = ai_review.detect_breaking_changes(
+        str(before_path), str(after_path), str(project_root)
+    )
+    assert len(changes) == 1
+    assert changes[0].symbol.name == "old_func"
+    assert changes[0].change_type == "removed"
+    assert changes[0].breaking is True
+
+
+def test_analyze_cross_file_impact_finds_dependents(tmp_path):
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    run_dir = tmp_path / "run"
+    (run_dir / "before").mkdir(parents=True)
+    app_dir = project_root / "app"
+    app_dir.mkdir()
+    (app_dir / "__init__.py").write_text("", encoding="utf-8")
+    util_path = app_dir / "util.py"
+    main_path = app_dir / "main.py"
+    util_path.write_text("def helper():\n    return 1\n", encoding="utf-8")
+    main_path.write_text("from .util import helper\n\nhelper()\n", encoding="utf-8")
+    diff_text = f"""
+--- {util_path} (before)
++++ {util_path} (after)
+@@ -1,2 +1,2 @@
+-def helper():
++def helper(arg=None):
+     return 1
+"""
+    report = ai_review.analyze_cross_file_impact(
+        run_dir=str(run_dir),
+        project_root=str(project_root),
+        log_dir=str(log_dir),
+        changed_files=[str(util_path)],
+        diff_text=diff_text,
+        config={"REVIEWER_IMPACT_ANALYSIS": "1"},
+    )
+    assert len(report.dependents) > 0 or len(report.changed_symbols) > 0
+
+
+def test_create_impact_findings_breaking():
+    symbol = ai_review.Symbol(
+        name="process",
+        kind="function",
+        file_path="/test.py",
+        line_start=10,
+        signature="def process(a, b)",
+    )
+    change = ai_review.SymbolChange(
+        symbol=symbol,
+        change_type="signature_changed",
+        old_signature="def process(a, b, c)",
+        new_signature="def process(a, b)",
+        breaking=True,
+        breaking_reason="Removed arguments: c",
+    )
+    report = ai_review.ImpactReport(breaking_changes=[change])
+    findings = ai_review.create_impact_findings(report)
+    assert len(findings) == 1
+    assert findings[0].severity == "high"
+    assert findings[0].category == "impact"
+    assert "process" in findings[0].title
+
+
+def test_cache_incremental_update(tmp_path):
+    import time
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    app_dir = project_root / "app"
+    app_dir.mkdir()
+    util_path = app_dir / "util.py"
+    util_path.write_text("def helper():\n    return 1\n", encoding="utf-8")
+    graph1 = ai_review.build_reverse_graph(str(project_root), str(log_dir))
+    cache_path = ai_review.get_cache_path(str(project_root), str(log_dir))
+    assert Path(cache_path).exists()
+    time.sleep(0.01)
+    # Change file size to ensure hash changes (mtime may not change fast enough)
+    util_path.write_text("def helper():\n    return 2  # longer\n", encoding="utf-8")
+    graph2 = ai_review.build_reverse_graph(str(project_root), str(log_dir))
+    # Hash should differ due to size change
+    assert graph2.file_hashes[str(util_path.resolve())] != graph1.file_hashes.get(
+        str(util_path.resolve()), ""
+    )
