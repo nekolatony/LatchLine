@@ -458,6 +458,70 @@ def list_test_files(project_root: str, changed_files: list[str]) -> list[str]:
     return sorted(matches)
 
 
+def get_rules_paths(
+    changed_files: list[str],
+    project_root: str,
+) -> list[tuple[str, str]]:
+    """Get list of (rules_path, label) tuples for all applicable rules files.
+    Returns paths in order: global → project → directories (deduplicated).
+    """
+    paths: list[tuple[str, str]] = []
+    seen_dirs: set[str] = set()
+    global_rules = os.path.expanduser("~/.latchline/rules.md")
+    if os.path.isfile(global_rules):
+        paths.append((global_rules, "Global Rules (~/.latchline/rules.md)"))
+    if project_root:
+        project_rules = os.path.join(project_root, ".latchline", "rules.md")
+        if os.path.isfile(project_rules):
+            paths.append((project_rules, "Project Rules"))
+            seen_dirs.add(os.path.dirname(project_rules))
+    if project_root:
+        for changed_file in changed_files:
+            if not changed_file:
+                continue
+            file_dir = os.path.dirname(changed_file)
+            for directory in iter_dirs_to_root(file_dir, project_root):
+                rules_dir = os.path.join(directory, ".latchline")
+                if rules_dir in seen_dirs:
+                    continue
+                seen_dirs.add(rules_dir)
+                rules_path = os.path.join(rules_dir, "rules.md")
+                if os.path.isfile(rules_path):
+                    rel_dir = os.path.relpath(directory, project_root)
+                    if rel_dir == ".":
+                        continue  # Already included as project rules
+                    label = f"Module Rules ({rel_dir})"
+                    paths.append((rules_path, label))
+    return paths
+
+
+def collect_custom_rules(
+    changed_files: list[str],
+    project_root: str,
+    config: dict[str, str],
+) -> str:
+    """Collect and concatenate rules.md files from all applicable locations.
+    Returns concatenated rules with section headers, or empty string if disabled/none found.
+    """
+    enabled = parse_bool(
+        config.get("REVIEWER_CUSTOM_RULES") or os.environ.get("REVIEWER_CUSTOM_RULES"),
+        True,
+    )
+    if not enabled:
+        return ""
+    rules_paths = get_rules_paths(changed_files, project_root)
+    if not rules_paths:
+        return ""
+    sections: list[str] = []
+    for rules_path, label in rules_paths:
+        content = read_text(rules_path).strip()
+        if content:
+            sections.append(f"=== {label} ===\n\n{content}")
+    if not sections:
+        return ""
+    return "\n\n".join(sections)
+
+
 def resolve_python_module(
     module: str, level: int, file_dir: str, project_root: str
 ) -> list[str]:
@@ -1412,7 +1476,7 @@ SEMANTIC_FOCUS = (
 )
 
 STRUCTURED_REVIEW_TEMPLATE = """You are a strict code reviewer. {pass_focus}
-
+{custom_rules}
 The diff is the source of truth; use context files only to interpret the diff.
 IMPORTANT: Verify every claim. Use web search if needed.
 
@@ -1444,11 +1508,12 @@ Confidence guidelines:
 - 0-29: Speculative - mention for awareness only"""
 
 
-def build_structured_review_prompt(pass_type: str) -> str:
+def build_structured_review_prompt(pass_type: str, custom_rules: str = "") -> str:
     """Build prompt requesting JSON output with findings schema."""
+    rules_section = f"\n\n{custom_rules}\n" if custom_rules else ""
     if pass_type == "smoke":
-        return STRUCTURED_REVIEW_TEMPLATE.format(pass_focus=SMOKE_FOCUS)
-    return STRUCTURED_REVIEW_TEMPLATE.format(pass_focus=SEMANTIC_FOCUS)
+        return STRUCTURED_REVIEW_TEMPLATE.format(pass_focus=SMOKE_FOCUS, custom_rules=rules_section)
+    return STRUCTURED_REVIEW_TEMPLATE.format(pass_focus=SEMANTIC_FOCUS, custom_rules=rules_section)
 
 
 def parse_structured_output(raw_output: str, pass_number: int, backend: str) -> ReviewResult:
@@ -2014,11 +2079,15 @@ def run_codex(
     base_dir: str,
     context_file: str,
     project_root: str,
+    custom_rules: str = "",
 ) -> None:
     if not shutil.which("codex"):
         return
     context_text = read_text(context_file) if context_file else ""
-    input_text = f"{review_prompt}\n\nDIFF:\n{diff}\n"
+    prompt = review_prompt
+    if custom_rules:
+        prompt += f"\n\n{custom_rules}"
+    input_text = f"{prompt}\n\nDIFF:\n{diff}\n"
     if context_text:
         input_text += f"\nCONTEXT:\n{context_text}\n"
     cmd = [
@@ -2045,13 +2114,17 @@ def run_claude(
     base_dir: str,
     context_file: str,
     project_root: str,
+    custom_rules: str = "",
 ) -> None:
     if not shutil.which("claude"):
         return
+    full_prompt = review_prompt
+    if custom_rules:
+        full_prompt += f"\n\n{custom_rules}"
     prompt = f"Review the diff at {diff_file}."
     if context_file:
         prompt += f" Additional context is available at {context_file}."
-    prompt += f" Use the following format:\n{review_prompt}"
+    prompt += f" Use the following format:\n{full_prompt}"
     cmd = [
         "claude",
         "-p",
@@ -2077,11 +2150,12 @@ def run_codex_structured(
     base_dir: str,
     context_file: str,
     project_root: str,
+    custom_rules: str = "",
 ) -> ReviewResult | None:
     """Run Codex with structured JSON prompt and parse result."""
     if not shutil.which("codex"):
         return None
-    prompt = build_structured_review_prompt(pass_type)
+    prompt = build_structured_review_prompt(pass_type, custom_rules)
     context_text = read_text(context_file) if context_file else ""
     input_text = f"{prompt}\n\nDIFF:\n{diff}\n"
     if context_text:
@@ -2113,11 +2187,12 @@ def run_claude_structured(
     base_dir: str,
     context_file: str,
     project_root: str,
+    custom_rules: str = "",
 ) -> ReviewResult | None:
     """Run Claude with structured JSON prompt and parse result."""
     if not shutil.which("claude"):
         return None
-    review_prompt = build_structured_review_prompt(pass_type)
+    review_prompt = build_structured_review_prompt(pass_type, custom_rules)
     prompt = f"Review the diff at {diff_file}."
     if context_file:
         prompt += f" Additional context is available at {context_file}."
@@ -2152,6 +2227,7 @@ def run_multi_pass_review(
     context_file: str,
     project_root: str,
     config: dict[str, str],
+    custom_rules: str = "",
 ) -> tuple[ReviewResult | None, ReviewResult | None]:
     """Run two-pass review: smoke check first, then semantic if needed."""
     confidence_threshold = parse_int(
@@ -2164,35 +2240,36 @@ def run_multi_pass_review(
     if backend == "codex":
         smoke_out = os.path.join(run_dir, "review.codex.smoke.md")
         smoke_result = run_codex_structured(
-            "smoke", diff, smoke_out, base_dir, context_file, project_root
+            "smoke", diff, smoke_out, base_dir, context_file, project_root, custom_rules
         )
         if smoke_result and has_blocking_findings(smoke_result, confidence_threshold):
             return smoke_result, None
         semantic_out = os.path.join(run_dir, "review.codex.semantic.md")
         semantic_result = run_codex_structured(
-            "semantic", diff, semantic_out, base_dir, context_file, project_root
+            "semantic", diff, semantic_out, base_dir, context_file, project_root, custom_rules
         )
     elif backend == "claude":
         smoke_out = os.path.join(run_dir, "review.claude.smoke.md")
         smoke_result = run_claude_structured(
-            "smoke", diff_file, run_dir, smoke_out, base_dir, context_file, project_root
+            "smoke", diff_file, run_dir, smoke_out, base_dir, context_file,
+            project_root, custom_rules,
         )
         if smoke_result and has_blocking_findings(smoke_result, confidence_threshold):
             return smoke_result, None
         semantic_out = os.path.join(run_dir, "review.claude.semantic.md")
         semantic_result = run_claude_structured(
             "semantic", diff_file, run_dir, semantic_out,
-            base_dir, context_file, project_root
+            base_dir, context_file, project_root, custom_rules
         )
     elif backend == "both":
         smoke_codex_out = os.path.join(run_dir, "review.codex.smoke.md")
         smoke_codex = run_codex_structured(
-            "smoke", diff, smoke_codex_out, base_dir, context_file, project_root
+            "smoke", diff, smoke_codex_out, base_dir, context_file, project_root, custom_rules
         )
         smoke_claude_out = os.path.join(run_dir, "review.claude.smoke.md")
         smoke_claude = run_claude_structured(
             "smoke", diff_file, run_dir, smoke_claude_out,
-            base_dir, context_file, project_root
+            base_dir, context_file, project_root, custom_rules
         )
         smoke_result = smoke_codex or smoke_claude
         if smoke_result:
@@ -2209,12 +2286,12 @@ def run_multi_pass_review(
             return smoke_result, None
         semantic_codex_out = os.path.join(run_dir, "review.codex.semantic.md")
         semantic_codex = run_codex_structured(
-            "semantic", diff, semantic_codex_out, base_dir, context_file, project_root
+            "semantic", diff, semantic_codex_out, base_dir, context_file, project_root, custom_rules
         )
         semantic_claude_out = os.path.join(run_dir, "review.claude.semantic.md")
         semantic_claude = run_claude_structured(
             "semantic", diff_file, run_dir, semantic_claude_out,
-            base_dir, context_file, project_root
+            base_dir, context_file, project_root, custom_rules
         )
         semantic_result = semantic_codex or semantic_claude
         if semantic_result:
@@ -2594,6 +2671,7 @@ def main() -> int:
         codex_out = os.path.join(run_dir, "review.codex.md")
         claude_out = os.path.join(run_dir, "review.claude.md")
         changed_files = [line for line in read_lines(files_file) if line]
+        custom_rules = collect_custom_rules(changed_files, project_root, config)
         impact_report = analyze_cross_file_impact(
             run_dir=run_dir,
             project_root=project_root,
@@ -2615,7 +2693,7 @@ def main() -> int:
         if multi_pass:
             smoke, semantic = run_multi_pass_review(
                 backend, diff, diff_file, run_dir, base_dir,
-                context_file, project_root, config,
+                context_file, project_root, config, custom_rules,
             )
             if smoke:
                 structured_results.append(smoke)
@@ -2630,6 +2708,7 @@ def main() -> int:
                     base_dir,
                     context_file,
                     project_root,
+                    custom_rules,
                 )
                 if os.path.isfile(codex_out):
                     result = parse_structured_output(read_text(codex_out), 1, "codex")
@@ -2643,6 +2722,7 @@ def main() -> int:
                     base_dir,
                     context_file,
                     project_root,
+                    custom_rules,
                 )
                 if os.path.isfile(claude_out):
                     result = parse_structured_output(read_text(claude_out), 1, "claude")
@@ -2655,6 +2735,7 @@ def main() -> int:
                     base_dir,
                     context_file,
                     project_root,
+                    custom_rules,
                 )
                 run_claude(
                     review_prompt,
@@ -2664,6 +2745,7 @@ def main() -> int:
                     base_dir,
                     context_file,
                     project_root,
+                    custom_rules,
                 )
                 if os.path.isfile(codex_out):
                     result = parse_structured_output(read_text(codex_out), 1, "codex")

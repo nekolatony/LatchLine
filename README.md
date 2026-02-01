@@ -75,6 +75,7 @@ See `config/reviewer.conf` for defaults and supported values.
 | `REVIEWER_IMPACT_MAX_DEPENDENTS` | `20` | Any integer | Maximum number of dependent files to report. |
 | `REVIEWER_IMPACT_DEPTH` | `1` | `0+` | Transitive dependency depth (`0` = direct only, `1+` = include transitive). |
 | `REVIEWER_INCLUDE_DEPENDENTS` | `0` | `0`, `1` | Add dependent files to context bundle for reviewer. |
+| `REVIEWER_CUSTOM_RULES` | `1` | `0`, `1` | Enable custom rules from `rules.md` files. |
 | `LATCHLINE_LOG_DIR` | `/tmp` | Any path | Base directory for logs/state/runs (created if missing, falls back to `/tmp` on failure). |
 
 ## Output Files
@@ -128,6 +129,45 @@ Output files:
 - `impact.md`: Human-readable summary
 
 The dependency graph is cached in `$LATCHLINE_LOG_DIR/cache/` and incrementally updated based on file modification times.
+
+### Custom Rules
+Define custom review rules via `rules.md` files. Rules are free-form markdown instructions passed directly to the AI reviewer.
+
+**File locations** (checked in order, all applicable rules are included):
+1. `~/.latchline/rules.md` - Global rules (apply everywhere)
+2. `{project_root}/.latchline/rules.md` - Project rules
+3. `{dir}/.latchline/rules.md` - Directory rules (for each directory from project root toward changed files)
+
+Rules cascade with more specific rules taking priority. The AI naturally understands that directory-level rules override project-level rules which override global rules.
+
+**Example `~/.latchline/rules.md`:**
+```markdown
+# My Global Rules
+
+- Always use type hints in Python
+- Prefer composition over inheritance
+- No print statements, use logging
+```
+
+**Example `project/.latchline/rules.md`:**
+```markdown
+# Project Rules
+
+This is a FastAPI project:
+- Use Pydantic models for request/response
+- All endpoints need OpenAPI descriptions
+```
+
+**Example `project/services/payments/.latchline/rules.md`:**
+```markdown
+# Payment Service Rules
+
+PCI compliance required:
+- Never log card numbers or CVV
+- Use parameterized queries only
+```
+
+All applicable rules are concatenated with section headers and injected into the review prompt.
 
 ## Development
 Run tests with `uv run --group dev pytest` or `just test`.

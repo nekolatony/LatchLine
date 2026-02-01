@@ -711,3 +711,107 @@ def test_cache_incremental_update(tmp_path):
     assert graph2.file_hashes[str(util_path.resolve())] != graph1.file_hashes.get(
         str(util_path.resolve()), ""
     )
+
+
+# Custom rules tests
+
+def test_collect_custom_rules_global_only(tmp_path, monkeypatch):
+    """Test that global rules.md is collected when it's the only one."""
+    home = tmp_path / "home"
+    home.mkdir()
+    global_rules = home / ".latchline" / "rules.md"
+    global_rules.parent.mkdir(parents=True)
+    global_rules.write_text("# Global Rules\n- Rule 1\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    result = ai_review.collect_custom_rules([], "", {"REVIEWER_CUSTOM_RULES": "1"})
+    assert "=== Global Rules" in result
+    assert "Rule 1" in result
+
+
+def test_collect_custom_rules_project_only(tmp_path, monkeypatch):
+    """Test that project rules.md is collected."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    project_rules = project_root / ".latchline" / "rules.md"
+    project_rules.parent.mkdir(parents=True)
+    project_rules.write_text("# Project Rules\n- Project rule\n", encoding="utf-8")
+    result = ai_review.collect_custom_rules([], str(project_root), {"REVIEWER_CUSTOM_RULES": "1"})
+    assert "=== Project Rules ===" in result
+    assert "Project rule" in result
+
+
+def test_collect_custom_rules_hierarchy(tmp_path, monkeypatch):
+    """Test global + project + module rules are all collected."""
+    home = tmp_path / "home"
+    home.mkdir()
+    global_rules = home / ".latchline" / "rules.md"
+    global_rules.parent.mkdir(parents=True)
+    global_rules.write_text("# Global\n- Global rule\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    project_rules = project_root / ".latchline" / "rules.md"
+    project_rules.parent.mkdir(parents=True)
+    project_rules.write_text("# Project\n- Project rule\n", encoding="utf-8")
+    module_dir = project_root / "services" / "payments"
+    module_dir.mkdir(parents=True)
+    module_rules = module_dir / ".latchline" / "rules.md"
+    module_rules.parent.mkdir(parents=True)
+    module_rules.write_text("# Payments\n- Payment rule\n", encoding="utf-8")
+    changed_files = [str(module_dir / "handler.py")]
+    result = ai_review.collect_custom_rules(
+        changed_files, str(project_root), {"REVIEWER_CUSTOM_RULES": "1"}
+    )
+    assert "=== Global Rules" in result
+    assert "Global rule" in result
+    assert "=== Project Rules ===" in result
+    assert "Project rule" in result
+    assert "=== Module Rules (services/payments) ===" in result
+    assert "Payment rule" in result
+
+
+def test_collect_custom_rules_disabled(tmp_path, monkeypatch):
+    """Test that REVIEWER_CUSTOM_RULES=0 returns empty string."""
+    home = tmp_path / "home"
+    home.mkdir()
+    global_rules = home / ".latchline" / "rules.md"
+    global_rules.parent.mkdir(parents=True)
+    global_rules.write_text("# Global Rules\n- Rule 1\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    result = ai_review.collect_custom_rules([], "", {"REVIEWER_CUSTOM_RULES": "0"})
+    assert result == ""
+
+
+def test_collect_custom_rules_no_files(tmp_path, monkeypatch):
+    """Test that no rules.md files returns empty string."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    result = ai_review.collect_custom_rules([], str(project_root), {"REVIEWER_CUSTOM_RULES": "1"})
+    assert result == ""
+
+
+def test_get_rules_paths_deduplication(tmp_path, monkeypatch):
+    """Test that same directory is not included twice."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    module_dir = project_root / "services"
+    module_dir.mkdir(parents=True)
+    module_rules = module_dir / ".latchline" / "rules.md"
+    module_rules.parent.mkdir(parents=True)
+    module_rules.write_text("# Module\n", encoding="utf-8")
+    changed_files = [
+        str(module_dir / "file1.py"),
+        str(module_dir / "file2.py"),
+    ]
+    paths = ai_review.get_rules_paths(changed_files, str(project_root))
+    labels = [label for _, label in paths]
+    assert labels.count("Module Rules (services)") == 1
