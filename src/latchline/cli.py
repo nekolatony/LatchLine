@@ -1360,7 +1360,9 @@ def build_context_bundle(
     deps = expand_dependencies(abs_changed, root, depth)
     dependent_files: list[str] = []
     if include_dependents and impact_report:
-        dependent_files = [d.file_path for d in impact_report.dependents if os.path.isfile(d.file_path)]
+        dependent_files = [
+            d.file_path for d in impact_report.dependents if os.path.isfile(d.file_path)
+        ]
 
     ordered: list[str] = []
     seen: set[str] = set()
@@ -1477,7 +1479,7 @@ SEMANTIC_FOCUS = (
 
 STRUCTURED_REVIEW_TEMPLATE = """You are a strict code reviewer. {pass_focus}
 {custom_rules}
-If a finding relates to a custom rule above, explicitly cite the rule name/section in your title and description.
+If a finding relates to a custom rule above, cite the rule name/section in your description.
 The diff is the source of truth; use context files only to interpret the diff.
 IMPORTANT: Verify every claim. Use web search if needed.
 
