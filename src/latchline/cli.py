@@ -1477,6 +1477,7 @@ SEMANTIC_FOCUS = (
 
 STRUCTURED_REVIEW_TEMPLATE = """You are a strict code reviewer. {pass_focus}
 {custom_rules}
+If a finding relates to a custom rule above, explicitly cite the rule name/section in your title and description.
 The diff is the source of truth; use context files only to interpret the diff.
 IMPORTANT: Verify every claim. Use web search if needed.
 
