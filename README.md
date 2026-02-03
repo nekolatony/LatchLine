@@ -1,74 +1,85 @@
 # LatchLine
 
-LatchLine is a global Claude Code/Codex review hook that gates changes per prompt, logs diffs, and asks for explicit approval before applying feedback.
+LatchLine is a Claude Code review hook that gates changes, logs diffs, and requires explicit approval before proceeding.
 
-## Why “LatchLine”
-LatchLine is named for a latch: it holds changes at the end of a prompt, shows the review, and only proceeds when you explicitly release it (apply/skip).
+Named for a latch: it holds changes at the end of a prompt, shows the review, and only releases when you explicitly approve (apply/skip).
 
 ## Prerequisites
+
 - Python 3.10+
-- uv
-- Claude Code with hook support enabled
+- [uv](https://github.com/astral-sh/uv)
+- Claude Code with hook support
 - Optional: Codex CLI (for `REVIEWER_BACKEND=codex`)
 
-## How to set up
-1. Clone this repo and note the absolute path.
-2. Copy `config/reviewer.conf` to `~/.latchline/settings.conf` (global) or to `.latchline/settings.conf` in your project root/current directory.
-3. Register the hook command in `~/.claude/settings.json` using the repo path (example below).
-4. Restart Claude Code so the hook config is reloaded.
+## Quick Start
 
-## Hook setup (Claude Code)
-LatchLine runs as a Claude Code hook command and must be registered for these events:
-- `UserPromptSubmit`
-- `PreToolUse` (with `Edit|Write`)
-- `PostToolUse` (with `AskUserQuestion`)
-- `Stop`
+1. Clone and note the path:
+   ```bash
+   git clone https://github.com/nekolatony/LatchLine.git
+   ```
 
-Why each hook is needed:
+2. Copy config:
+   ```bash
+   mkdir -p ~/.latchline
+   cp config/reviewer.conf ~/.latchline/settings.conf
+   ```
 
-| Hook event | When it fires | Why it matters |
-| --- | --- | --- |
-| `UserPromptSubmit` | At the start of a prompt | Starts a new review session so edits are grouped correctly. |
-| `PreToolUse` (`Edit|Write`) | Right before edits | Captures a “before” snapshot so we can diff after edits. |
-| `PostToolUse` (`AskUserQuestion`) | After the review gate prompt | Records your apply/skip response so the run log is complete. |
-| `Stop` | When the prompt finishes | Finalizes the diff and runs the reviewer. |
+3. Add hooks to `~/.claude/settings.json`:
+   ```json
+   {
+     "hooks": {
+       "UserPromptSubmit": [
+         { "hooks": [{ "type": "command", "command": "uv run --project /path/to/LatchLine latchline" }] }
+       ],
+       "PreToolUse": [
+         {
+           "matcher": "Edit|Write",
+           "hooks": [{ "type": "command", "command": "uv run --project /path/to/LatchLine latchline" }]
+         }
+       ],
+       "PostToolUse": [
+         {
+           "matcher": "AskUserQuestion",
+           "hooks": [{ "type": "command", "command": "uv run --project /path/to/LatchLine latchline" }]
+         }
+       ],
+       "Stop": [
+         { "hooks": [{ "type": "command", "command": "uv run --project /path/to/LatchLine latchline" }] }
+       ]
+     }
+   }
+   ```
 
-Example `~/.claude/settings.json`:
-```json
-{
-  "hooks": {
-    "UserPromptSubmit": [
-      { "hooks": [{ "type": "command", "command": "uv run --project /path/to/LatchLine latchline" }] }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": "Edit|Write",
-        "hooks": [{ "type": "command", "command": "uv run --project /path/to/LatchLine latchline" }]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "AskUserQuestion",
-        "hooks": [{ "type": "command", "command": "uv run --project /path/to/LatchLine latchline" }]
-      }
-    ],
-    "Stop": [
-      { "hooks": [{ "type": "command", "command": "uv run --project /path/to/LatchLine latchline" }] }
-    ]
-  }
-}
-```
+4. Restart Claude Code.
 
-## Configuration
-See `config/reviewer.conf` for defaults and supported values.
+## Usage
 
-| Config | Default | Values | Explanation |
-| --- | --- | --- | --- |
-| `REVIEWER_BACKEND` | `codex` | `codex`, `claude`, `both` | Which reviewer to run. |
-| `REVIEWER_BLOCK` | `0` | `0`, `1`, `2` | How hard to gate the session (`0` = log only, `1` = block on blockers, `2` = always block and ask for apply/skip). |
-| `LATCHLINE_LOG_DIR` | `/tmp` | Any path | Base directory for logs/state/runs (created if missing, falls back to `/tmp` on failure). |
+After any edit, LatchLine shows a review. Respond with:
+- `review:apply` - Accept and continue
+- `review:skip` - Skip reviews for this session
+- `review:enable` - Re-enable after skip
+
+## Documentation
+
+- [Configuration](docs/configuration.md) - All settings explained
+- [Custom Rules](docs/custom-rules.md) - Writing project-specific rules
+- [Features](docs/features.md) - Multi-pass review, impact analysis, confidence scoring
+
+## Key Features
+
+- **Multi-pass review**: Fast smoke check, then deep semantic analysis
+- **Confidence scoring**: Findings rated 0-100, configurable threshold for blocking
+- **Context bundling**: Includes surrounding code for better review accuracy
+- **Custom rules**: Define rules via `rules.md` at global, project, or directory level
+- **Cross-file impact**: Detects breaking changes and tracks dependents
+- **Diff highlighting**: Findings mapped to specific lines
 
 ## Development
-Run tests with `uv run --group dev pytest` or `just test`.
-Format with `just format` and lint with `just lint`.
-Run the full Python version matrix with `just test-all`.
+
+```bash
+uv run --group dev pytest    # Run tests
+just test                    # Run tests (alternative)
+just format                  # Format code
+just lint                    # Lint code
+just test-all                # Full Python version matrix
+```
